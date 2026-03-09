@@ -2,6 +2,16 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    _env_path = Path.home() / ".vplan" / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
+except ImportError:
+    pass
+
 VPLAN_DIR = Path.home() / ".vplan"
 CONFIG_PATH = VPLAN_DIR / "config.json"
 

@@ -13,6 +13,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "playwright>=1.40",
     "playwright-stealth>=2.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]
