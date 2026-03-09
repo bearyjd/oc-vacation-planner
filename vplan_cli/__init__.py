@@ -1,0 +1,1 @@
+"""OpenClaw Vacation Planner CLI."""
