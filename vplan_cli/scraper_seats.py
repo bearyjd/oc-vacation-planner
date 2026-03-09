@@ -160,6 +160,18 @@ def search_flights(
         return scraper.search_flights(origin, destination, cabin, limit)
 
 
+def search_round_trip(
+    origin: str,
+    destination: str,
+    cabin: str = "economy",
+    limit: int = 50,
+) -> dict[str, list[dict[str, Any]]]:
+    with SeatsAeroScraper(headless=True) as scraper:
+        outbound = scraper.search_flights(origin, destination, cabin, limit)
+        ret = scraper.search_flights(destination, origin, cabin, limit)
+        return {"outbound": outbound, "return": ret}
+
+
 if __name__ == "__main__":
     with SeatsAeroScraper(headless=True) as s:
         results = s.search_flights("IAD", "CUN", "economy")

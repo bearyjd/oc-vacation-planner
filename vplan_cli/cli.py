@@ -1,13 +1,10 @@
 import argparse
 import json
 import os
-import re
 import sys
 import textwrap
-from datetime import datetime, timedelta
 
 import requests
-from bs4 import BeautifulSoup
 
 from vplan_cli.config import (
     DEFAULT_UA,
@@ -24,6 +21,18 @@ from vplan_cli.config import (
     load_trip,
     save_credentials,
     save_trip,
+    update_config,
+)
+from vplan_cli.data_sources import (
+    HYATT_CATEGORIES,
+    calculate_redemption,
+    family_suitability,
+    fetch_weather,
+    generate_itinerary,
+    lookup_awards,
+    lookup_visa,
+    scrape_wikivoyage,
+    search_hotels_liteapi,
 )
 
 
@@ -37,185 +46,20 @@ def _session() -> requests.Session:
     return s
 
 
-# ---------------------------------------------------------------------------
-# vplan research
-# ---------------------------------------------------------------------------
-
 RESEARCH_SOURCES = [
-    {
-        "name": "Wikivoyage",
-        "url_template": "https://en.wikivoyage.org/wiki/{query}",
-        "search_url": "https://en.wikivoyage.org/w/index.php?search={query}&fulltext=1",
-    },
-    {
-        "name": "Wikitravel",
-        "url_template": "https://wikitravel.org/en/{query}",
-    },
+    "Wikivoyage",
+    "Open-Meteo (weather)",
 ]
 
-
-def _resolve_wikivoyage_title(destination: str, s: requests.Session) -> str | None:
-    try:
-        r = s.get(
-            "https://en.wikivoyage.org/w/api.php",
-            params={"action": "opensearch", "search": destination, "limit": 1, "format": "json"},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if len(data) >= 4 and data[1]:
-                return data[1][0]
-    except requests.RequestException:
-        pass
-    return None
-
-
-def _scrape_wikivoyage(destination: str, s: requests.Session) -> dict:
-    title = _resolve_wikivoyage_title(destination, s) or destination
-    slug = title.replace(" ", "_")
-    url = f"https://en.wikivoyage.org/wiki/{requests.utils.quote(slug)}"
-    try:
-        r = s.get(url, timeout=15)
-        if r.status_code != 200:
-            return {}
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        parser_output = soup.select_one("#mw-content-text .mw-parser-output")
-        if not parser_output:
-            return {}
-
-        sections = {}
-        current_heading = "Overview"
-        current_text = []
-
-        for el in parser_output.descendants:
-            tag_name = getattr(el, "name", None)
-            if tag_name in ("h2", "h3"):
-                heading_el = el.select_one(".mw-headline") or el.select_one("[id]")
-                heading_text = heading_el.get_text(strip=True) if heading_el else el.get_text(strip=True)
-                heading_text = heading_text.replace("[edit]", "").strip()
-                if heading_text:
-                    if current_text:
-                        sections[current_heading] = "\n".join(current_text).strip()
-                    current_heading = heading_text
-                    current_text = []
-            elif tag_name == "p":
-                text = el.get_text(strip=True)
-                if text and len(text) > 10:
-                    current_text.append(text)
-
-        if current_text:
-            sections[current_heading] = "\n".join(current_text).strip()
-
-        return sections
-
-    except requests.RequestException:
-        return {}
-
-
-MONTH_NUMBERS = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
-    "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+TRANSFER_PARTNERS = {
+    "chase_ur_to_hyatt": {"name": "Chase UR -> Hyatt", "ratio": 1.0, "type": "hotel", "cpp_target": 2.0},
+    "chase_ur_to_united": {"name": "Chase UR -> United", "ratio": 1.0, "type": "airline", "cpp_target": 1.5},
+    "chase_ur_to_southwest": {"name": "Chase UR -> Southwest", "ratio": 1.0, "type": "airline", "cpp_target": 1.4},
+    "chase_ur_portal": {"name": "Chase Travel Portal (1.5x)", "ratio": 1.5, "type": "portal", "cpp_target": 1.5},
+    "united_direct": {"name": "United MileagePlus", "ratio": 1.0, "type": "airline", "cpp_target": 1.3},
+    "delta_direct": {"name": "Delta SkyMiles", "ratio": 1.0, "type": "airline", "cpp_target": 1.2},
+    "delta_to_flying_blue": {"name": "Delta -> Flying Blue (indirect)", "ratio": 1.0, "type": "airline", "cpp_target": 1.5},
 }
-
-
-def _geocode(destination: str, s: requests.Session) -> tuple[float, float] | None:
-    try:
-        r = s.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": destination, "count": 1, "format": "json"},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("results"):
-                loc = data["results"][0]
-                return loc["latitude"], loc["longitude"]
-    except requests.RequestException:
-        pass
-    return None
-
-
-def _fetch_weather(destination: str, month: str, s: requests.Session) -> str:
-    coords = _geocode(destination, s)
-    if not coords:
-        return f"Could not find location for '{destination}'."
-
-    lat, lon = coords
-    month_num = MONTH_NUMBERS.get(month.lower().strip(), 0)
-    if not month_num:
-        return f"Unknown month '{month}'. Use full name (e.g. June) or abbreviation (e.g. Jun)."
-
-    year = datetime.now().year - 1
-    start_date = f"{year}-{month_num:02d}-01"
-    if month_num == 12:
-        end_date = f"{year}-12-31"
-    else:
-        next_month_start = datetime(year, month_num + 1, 1)
-        last_day = next_month_start - timedelta(days=1)
-        end_date = last_day.strftime("%Y-%m-%d")
-
-    try:
-        r = s.get(
-            "https://archive-api.open-meteo.com/v1/archive",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "start_date": start_date,
-                "end_date": end_date,
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
-            },
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return f"Weather API returned {r.status_code}. Try again later."
-
-        data = r.json()
-        daily = data.get("daily", {})
-        temps_max = daily.get("temperature_2m_max", [])
-        temps_min = daily.get("temperature_2m_min", [])
-        precip = daily.get("precipitation_sum", [])
-
-        if not temps_max:
-            return f"No weather data available for {destination} in {month}."
-
-        avg_high_c = sum(temps_max) / len(temps_max)
-        avg_low_c = sum(temps_min) / len(temps_min)
-        avg_high_f = avg_high_c * 9 / 5 + 32
-        avg_low_f = avg_low_c * 9 / 5 + 32
-        total_rain_mm = sum(precip)
-        total_rain_in = total_rain_mm / 25.4
-        rainy_days = sum(1 for p in precip if p > 1.0)
-
-        return (
-            f"Avg High: {avg_high_f:.0f}°F ({avg_high_c:.1f}°C) | "
-            f"Avg Low: {avg_low_f:.0f}°F ({avg_low_c:.1f}°C) | "
-            f"Rain: {total_rain_in:.1f}in ({total_rain_mm:.0f}mm) over {rainy_days} days"
-        )
-    except requests.RequestException:
-        return f"Could not fetch weather data for {destination}."
-
-
-def _family_suitability(destination: str, sections: dict) -> list:
-    tips = []
-    all_text = " ".join(sections.values()).lower()
-
-    kid_keywords = ["family", "children", "kids", "playground", "water park", "beach", "zoo",
-                    "aquarium", "theme park", "amusement", "snorkel"]
-    found = [kw for kw in kid_keywords if kw in all_text]
-    if found:
-        tips.append(f"Family-friendly mentions: {', '.join(found)}")
-    else:
-        tips.append("Limited family-specific info found — research kid-friendly activities separately.")
-
-    safety_keywords = ["safe", "danger", "crime", "scam", "avoid", "caution", "warning"]
-    safety_found = [kw for kw in safety_keywords if kw in all_text]
-    if safety_found:
-        tips.append(f"Safety-related mentions: {', '.join(safety_found)}")
-
-    return tips
 
 
 def cmd_research(args):
@@ -233,7 +77,7 @@ def cmd_research(args):
         "family": f"{FAMILY['adults']} adults + {len(FAMILY['kids'])} kids ({', '.join(FAMILY['kids'])})",
     }
 
-    sections = _scrape_wikivoyage(destination, s)
+    sections = scrape_wikivoyage(destination, s)
     if sections:
         result["overview"] = sections.get("Overview", sections.get("Understand", ""))[:1000]
 
@@ -243,8 +87,8 @@ def cmd_research(args):
     else:
         result["overview"] = f"Could not fetch guide for {destination}. Try Wikivoyage or TripAdvisor directly."
 
-    result["weather"] = _fetch_weather(destination, month, s)
-    result["family_tips"] = _family_suitability(destination, sections)
+    result["weather"] = fetch_weather(destination, month, s)
+    result["family_tips"] = family_suitability(destination, sections)
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -272,103 +116,6 @@ def cmd_research(args):
         print()
 
 
-# ---------------------------------------------------------------------------
-# vplan points
-# ---------------------------------------------------------------------------
-
-TRANSFER_PARTNERS = {
-    "chase_ur_to_hyatt": {"name": "Chase UR -> Hyatt", "ratio": 1.0, "type": "hotel", "cpp_target": 2.0},
-    "chase_ur_to_united": {"name": "Chase UR -> United", "ratio": 1.0, "type": "airline", "cpp_target": 1.5},
-    "chase_ur_to_southwest": {"name": "Chase UR -> Southwest", "ratio": 1.0, "type": "airline", "cpp_target": 1.4},
-    "chase_ur_portal": {"name": "Chase Travel Portal (1.5x)", "ratio": 1.5, "type": "portal", "cpp_target": 1.5},
-    "united_direct": {"name": "United MileagePlus", "ratio": 1.0, "type": "airline", "cpp_target": 1.3},
-    "delta_direct": {"name": "Delta SkyMiles", "ratio": 1.0, "type": "airline", "cpp_target": 1.2},
-    "delta_to_flying_blue": {"name": "Delta -> Flying Blue (indirect)", "ratio": 1.0, "type": "airline", "cpp_target": 1.5},
-}
-
-
-def _calculate_redemption(hotel_rate_usd: float, flights_usd: float) -> list:
-    total_cash = hotel_rate_usd + flights_usd
-    options = []
-
-    # Chase Travel Portal (1.5x) — covers both hotel + flights
-    chase = POINTS["chase_ur"]
-    portal_points_needed = int(total_cash / 0.015)
-    if portal_points_needed <= chase["balance"]:
-        options.append({
-            "strategy": "Chase Travel Portal (1.5x)",
-            "points_used": f"{portal_points_needed:,} Chase UR",
-            "cash_saved": f"${total_cash:,.0f}",
-            "cpp": 1.5,
-            "notes": f"Covers full trip. {chase['balance'] - portal_points_needed:,} UR remaining.",
-            "priority": "HIGH — UR expires Oct 2027, use first",
-        })
-
-    # Chase UR -> Hyatt for hotel, cash for flights
-    if hotel_rate_usd > 0:
-        hyatt_points_per_night = int(hotel_rate_usd / 0.02)  # ~2cpp target
-        hyatt_points_total = hyatt_points_per_night
-        if hyatt_points_total <= chase["balance"]:
-            cpp_actual = (hotel_rate_usd / hyatt_points_total) * 100 if hyatt_points_total else 0
-            options.append({
-                "strategy": "Chase UR -> Hyatt (hotel) + cash (flights)",
-                "points_used": f"{hyatt_points_total:,} Chase UR (transferred to Hyatt)",
-                "cash_spent": f"${flights_usd:,.0f} (flights)",
-                "cash_saved": f"${hotel_rate_usd:,.0f} (hotel)",
-                "cpp": round(cpp_actual, 1),
-                "notes": "Hyatt transfer is best hotel value. Check Hyatt availability at destination.",
-            })
-
-    # United miles for flights
-    united = POINTS["united"]
-    if flights_usd > 0:
-        united_miles_est = int(flights_usd / 0.013)  # ~1.3cpp
-        if united_miles_est <= united["balance"]:
-            cpp_actual = (flights_usd / united_miles_est) * 100 if united_miles_est else 0
-            options.append({
-                "strategy": "United miles (flights) + cash (hotel)",
-                "points_used": f"{united_miles_est:,} United miles",
-                "cash_spent": f"${hotel_rate_usd:,.0f} (hotel)",
-                "cash_saved": f"${flights_usd:,.0f} (flights)",
-                "cpp": round(cpp_actual, 1),
-                "notes": f"Premier 1K gets upgrades + PlusPoints. {united['balance'] - united_miles_est:,} miles remaining.",
-            })
-
-    # Delta SkyMiles for flights
-    delta = POINTS["delta"]
-    if flights_usd > 0:
-        delta_miles_est = int(flights_usd / 0.012)  # ~1.2cpp
-        if delta_miles_est <= delta["balance"]:
-            cpp_actual = (flights_usd / delta_miles_est) * 100 if delta_miles_est else 0
-            options.append({
-                "strategy": "Delta SkyMiles (flights) + cash (hotel)",
-                "points_used": f"{delta_miles_est:,} Delta SkyMiles",
-                "cash_spent": f"${hotel_rate_usd:,.0f} (hotel)",
-                "cash_saved": f"${flights_usd:,.0f} (flights)",
-                "cpp": round(cpp_actual, 1),
-                "notes": f"{delta['balance'] - delta_miles_est:,} SkyMiles remaining.",
-            })
-
-    # Combo: Chase UR -> United (flights) + Chase UR -> Hyatt (hotel)
-    if hotel_rate_usd > 0 and flights_usd > 0:
-        united_pts = int(flights_usd / 0.015)
-        hyatt_pts = int(hotel_rate_usd / 0.02)
-        total_ur = united_pts + hyatt_pts
-        if total_ur <= chase["balance"]:
-            options.append({
-                "strategy": "All points: UR -> United (flights) + UR -> Hyatt (hotel)",
-                "points_used": f"{total_ur:,} Chase UR ({united_pts:,} -> United, {hyatt_pts:,} -> Hyatt)",
-                "cash_spent": "$0",
-                "cash_saved": f"${total_cash:,.0f}",
-                "cpp": round((total_cash / total_ur) * 100, 1) if total_ur else 0,
-                "notes": f"Zero cash trip! {chase['balance'] - total_ur:,} UR remaining.",
-                "priority": "BEST VALUE — maximizes point value",
-            })
-
-    options.sort(key=lambda x: x.get("cpp", 0), reverse=True)
-    return options
-
-
 def cmd_points(args):
     hotel_rate = args.hotel_rate or 0
     flights_usd = args.flights_usd or 0
@@ -384,7 +131,7 @@ def cmd_points(args):
             "united": f"{POINTS['united']['balance']:,} miles (Premier 1K, {POINTS['united']['plus_points']} PlusPoints)",
             "delta": f"{POINTS['delta']['balance']:,} SkyMiles",
         },
-        "options": _calculate_redemption(hotel_rate, flights_usd),
+        "options": calculate_redemption(hotel_rate, flights_usd),
         "sweet_spots": SWEET_SPOTS,
         "reminder": "Chase UR 1.5x expires Oct 2027 — prioritize UR redemptions",
     }
@@ -422,113 +169,6 @@ def cmd_points(args):
         print(f"\n  ** Chase UR 1.5x expires Oct 2027 — use first **\n")
 
 
-# ---------------------------------------------------------------------------
-# vplan awards
-# ---------------------------------------------------------------------------
-
-AWARD_CHARTS = {
-    "united": {
-        "americas": {"saver": 35000, "everyday": 60000},
-        "europe": {"saver": 60000, "everyday": 100000},
-        "asia": {"saver": 70000, "everyday": 120000},
-        "oceania": {"saver": 70000, "everyday": 120000},
-        "africa": {"saver": 75000, "everyday": 130000},
-        "middle_east": {"saver": 70000, "everyday": 115000},
-    },
-    "delta": {
-        "americas": {"low": 25000, "mid": 50000, "high": 80000},
-        "europe": {"low": 50000, "mid": 85000, "high": 140000},
-        "asia": {"low": 65000, "mid": 100000, "high": 170000},
-        "oceania": {"low": 70000, "mid": 110000, "high": 180000},
-    },
-}
-
-REGION_MAP = {
-    "CUN": "americas", "MEX": "americas", "GDL": "americas", "SJD": "americas",
-    "BOG": "americas", "LIM": "americas", "GRU": "americas", "EZE": "americas",
-    "SCL": "americas", "PTY": "americas", "SJO": "americas", "MBJ": "americas",
-    "NAS": "americas", "PUJ": "americas", "UVF": "americas", "YYZ": "americas",
-    "YVR": "americas",
-    "LHR": "europe", "CDG": "europe", "FCO": "europe", "BCN": "europe",
-    "AMS": "europe", "FRA": "europe", "MUC": "europe", "ZRH": "europe",
-    "LIS": "europe", "ATH": "europe", "IST": "europe", "DUB": "europe",
-    "CPH": "europe", "ARN": "europe", "HEL": "europe", "PRG": "europe",
-    "VIE": "europe", "WAW": "europe",
-    "NRT": "asia", "HND": "asia", "ICN": "asia", "PEK": "asia",
-    "PVG": "asia", "HKG": "asia", "SIN": "asia", "BKK": "asia",
-    "DEL": "asia", "BOM": "asia", "MNL": "asia", "TPE": "asia",
-    "KUL": "asia", "DPS": "asia",
-    "SYD": "oceania", "MEL": "oceania", "AKL": "oceania", "NAN": "oceania",
-    "PPT": "oceania",
-    "JNB": "africa", "CPT": "africa", "NBO": "africa", "ADD": "africa",
-    "CMN": "africa", "CAI": "africa",
-    "DXB": "middle_east", "DOH": "middle_east", "AUH": "middle_east",
-    "TLV": "middle_east", "AMM": "middle_east",
-}
-
-
-def _lookup_awards(origin: str, dest: str, month: str) -> dict:
-    region = REGION_MAP.get(dest.upper(), "americas")
-
-    result = {
-        "route": f"{origin} -> {dest}",
-        "region": region,
-        "month": month,
-        "programs": [],
-        "search_links": [],
-    }
-
-    # United awards
-    united_chart = AWARD_CHARTS["united"].get(region, {})
-    if united_chart:
-        saver = united_chart.get("saver", 0)
-        everyday = united_chart.get("everyday", 0)
-        result["programs"].append({
-            "program": "United MileagePlus",
-            "balance": f"{POINTS['united']['balance']:,} miles",
-            "saver_rt": f"{saver * 2:,} miles (round trip)" if saver else "N/A",
-            "everyday_rt": f"{everyday * 2:,} miles (round trip)" if everyday else "N/A",
-            "family_of_5_saver": f"{saver * 2 * 5:,} miles" if saver else "N/A",
-            "can_afford_saver": (saver * 2 * 5) <= POINTS["united"]["balance"] if saver else False,
-            "notes": "Premier 1K: complimentary upgrades, PlusPoints for premium cabin",
-        })
-
-    # Chase UR -> United
-    if united_chart:
-        saver = united_chart.get("saver", 0)
-        ur_needed = saver * 2 * 5
-        result["programs"].append({
-            "program": "Chase UR -> United (1:1 transfer)",
-            "balance": f"{POINTS['chase_ur']['balance']:,} UR",
-            "family_of_5_saver": f"{ur_needed:,} UR" if saver else "N/A",
-            "can_afford": ur_needed <= POINTS["chase_ur"]["balance"] if saver else False,
-            "notes": "Transfer 1:1 to United. Combine with existing United miles.",
-        })
-
-    # Delta awards
-    delta_chart = AWARD_CHARTS["delta"].get(region, {})
-    if delta_chart:
-        low = delta_chart.get("low", 0)
-        mid = delta_chart.get("mid", 0)
-        result["programs"].append({
-            "program": "Delta SkyMiles",
-            "balance": f"{POINTS['delta']['balance']:,} SkyMiles",
-            "low_rt": f"{low * 2:,} SkyMiles (round trip)" if low else "N/A",
-            "mid_rt": f"{mid * 2:,} SkyMiles (round trip)" if mid else "N/A",
-            "family_of_5_low": f"{low * 2 * 5:,} SkyMiles" if low else "N/A",
-            "can_afford_low": (low * 2 * 5) <= POINTS["delta"]["balance"] if low else False,
-        })
-
-    result["search_links"] = [
-        f"https://www.united.com/en/us/fsr/choose-flights?f={origin}&t={dest}&d={month}&tt=1&at=1&sc=7&px=5&taxng=1&newHP=True&clm=7&st=bestmatches&fareWheel=True",
-        f"https://www.delta.com/flight-search/book-a-flight?cacheKeySuffix=a{dest}",
-        f"https://point.me/?origin={origin}&destination={dest}",
-        f"https://www.awardhacker.com/#{origin}-{dest}",
-    ]
-
-    return result
-
-
 def cmd_awards(args):
     origin = args.origin
     dest = args.dest
@@ -536,7 +176,7 @@ def cmd_awards(args):
     live = getattr(args, "live", False)
 
     _log(f"Searching award availability: {origin} -> {dest} in {month}...")
-    result = _lookup_awards(origin, dest, month)
+    result = lookup_awards(origin, dest, month)
 
     live_flights: list = []
     if live:
@@ -591,110 +231,11 @@ def cmd_awards(args):
         print()
 
 
-# ---------------------------------------------------------------------------
-# vplan visa
-# ---------------------------------------------------------------------------
-
-VISA_FREE = {
-    "mexico": {"required": False, "max_days": 180, "doc": "US passport (6mo validity)", "notes": "Tourist card (FMM) issued on arrival or online pre-registration. No visa needed."},
-    "canada": {"required": False, "max_days": 180, "doc": "US passport", "notes": "No visa needed for US citizens."},
-    "united kingdom": {"required": False, "max_days": 180, "doc": "US passport", "notes": "No visa for tourism up to 6 months."},
-    "france": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone — 90 days in any 180-day period."},
-    "germany": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone — 90 days in any 180-day period."},
-    "italy": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone — 90 days in any 180-day period."},
-    "spain": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone — 90 days in any 180-day period. ETIAS required starting 2025."},
-    "japan": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism. Visit Japan Web registration recommended."},
-    "south korea": {"required": False, "max_days": 90, "doc": "US passport + K-ETA", "notes": "K-ETA (electronic travel authorization) required. Apply online 72hrs before."},
-    "australia": {"required": True, "max_days": 90, "doc": "US passport + ETA", "notes": "Electronic Travel Authority (ETA) required. Apply via app. $20 AUD."},
-    "thailand": {"required": False, "max_days": 30, "doc": "US passport", "notes": "Visa exemption for 30 days (extendable to 60)."},
-    "costa rica": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa. Must show proof of return ticket."},
-    "colombia": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism up to 90 days."},
-    "peru": {"required": False, "max_days": 183, "doc": "US passport", "notes": "No visa for tourism. Reciprocity fee eliminated."},
-    "brazil": {"required": True, "max_days": 90, "doc": "US passport + visa or e-visa", "notes": "E-visa available online. $80.90 fee. Valid 10 years."},
-    "india": {"required": True, "max_days": 90, "doc": "US passport + e-visa", "notes": "E-tourist visa required. Apply online at indianvisaonline.gov.in. 30-day or 1-year options."},
-    "china": {"required": True, "max_days": 30, "doc": "US passport + visa", "notes": "Tourist visa (L) required. Apply at Chinese embassy/consulate. 10-year multiple entry available."},
-    "singapore": {"required": False, "max_days": 90, "doc": "US passport + SG Arrival Card", "notes": "No visa. Complete SG Arrival Card online 3 days before."},
-    "new zealand": {"required": False, "max_days": 90, "doc": "US passport + NZeTA", "notes": "NZeTA required. Apply via app. $17 NZD + $35 IVL."},
-    "iceland": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone — 90 days in 180-day period."},
-    "portugal": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone. ETIAS coming 2025."},
-    "greece": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "turkey": {"required": True, "max_days": 90, "doc": "US passport + e-visa", "notes": "E-visa required. Apply at evisa.gov.tr. $50. Multiple entry."},
-    "morocco": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism up to 90 days."},
-    "south africa": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for US citizens for stays under 90 days."},
-    "egypt": {"required": True, "max_days": 30, "doc": "US passport + visa", "notes": "Visa on arrival at airport ($25) or e-visa online."},
-    "argentina": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa. Reciprocity fee eliminated."},
-    "chile": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-    "dominican republic": {"required": False, "max_days": 30, "doc": "US passport + tourist card", "notes": "Tourist card ($10) usually included in airfare. E-Ticket form required."},
-    "jamaica": {"required": False, "max_days": 30, "doc": "US passport", "notes": "No visa. Immigration form required."},
-    "bahamas": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa. Bahamas Health Travel Visa may be required."},
-    "bermuda": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-    "aruba": {"required": False, "max_days": 30, "doc": "US passport + ED card", "notes": "No visa. Complete Embarkation/Disembarkation card online."},
-    "netherlands": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "switzerland": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "norway": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "sweden": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "denmark": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "ireland": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Not Schengen — separate entry. No visa."},
-    "croatia": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone (joined 2023)."},
-    "czech republic": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "hungary": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "poland": {"required": False, "max_days": 90, "doc": "US passport", "notes": "Schengen zone."},
-    "indonesia": {"required": True, "max_days": 30, "doc": "US passport + VOA", "notes": "Visa on Arrival at airport. $35. Extendable 30 days."},
-    "vietnam": {"required": True, "max_days": 45, "doc": "US passport + e-visa", "notes": "E-visa available for 45 days single entry. Apply online."},
-    "cambodia": {"required": True, "max_days": 30, "doc": "US passport + e-visa or VOA", "notes": "E-visa ($36) or Visa on Arrival ($30)."},
-    "philippines": {"required": False, "max_days": 30, "doc": "US passport", "notes": "No visa for 30 days. Extendable."},
-    "malaysia": {"required": False, "max_days": 90, "doc": "US passport + MDAC", "notes": "No visa. Malaysia Digital Arrival Card required."},
-    "taiwan": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-    "israel": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa. ETA-IL may be required."},
-    "jordan": {"required": True, "max_days": 30, "doc": "US passport + visa", "notes": "Visa on arrival at airport. ~40 JOD. Jordan Pass includes visa + Petra entrance."},
-    "uae": {"required": False, "max_days": 30, "doc": "US passport", "notes": "No visa for 30 days. Extendable."},
-    "qatar": {"required": False, "max_days": 30, "doc": "US passport", "notes": "Visa waiver for US citizens."},
-    "fiji": {"required": False, "max_days": 120, "doc": "US passport", "notes": "No visa for tourism up to 4 months."},
-    "maldives": {"required": False, "max_days": 30, "doc": "US passport", "notes": "Visa on arrival (free). Confirmed hotel booking required."},
-    "kenya": {"required": True, "max_days": 90, "doc": "US passport + eTA", "notes": "Electronic Travel Authorization required. Apply at etakenya.go.ke."},
-    "tanzania": {"required": True, "max_days": 90, "doc": "US passport + visa", "notes": "E-visa required. Apply online. $50."},
-    "rwanda": {"required": True, "max_days": 30, "doc": "US passport + visa or VOA", "notes": "Visa on arrival or e-visa. $30."},
-    "ethiopia": {"required": True, "max_days": 30, "doc": "US passport + e-visa", "notes": "E-visa required. Apply at evisa.gov.et."},
-    "cuba": {"required": True, "max_days": 30, "doc": "US passport + tourist card + license", "notes": "Tourist card (visa) required. US citizens need OFAC general license category. Support for the Cuban People is most common."},
-    "belize": {"required": False, "max_days": 30, "doc": "US passport", "notes": "No visa for tourism."},
-    "guatemala": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa. CA-4 agreement (90 days shared with Honduras, El Salvador, Nicaragua)."},
-    "panama": {"required": False, "max_days": 180, "doc": "US passport", "notes": "No visa for tourism up to 180 days."},
-    "ecuador": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-    "bolivia": {"required": True, "max_days": 30, "doc": "US passport + visa", "notes": "Visa required. Apply at embassy or VOA at some entry points. $160."},
-    "uruguay": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-    "paraguay": {"required": False, "max_days": 90, "doc": "US passport", "notes": "No visa for tourism."},
-}
-
-
-def _lookup_visa(country: str) -> dict:
-    key = country.lower().strip()
-    if key in VISA_FREE:
-        info = VISA_FREE[key]
-        return {
-            "country": country,
-            "visa_required": info["required"],
-            "max_stay_days": info["max_days"],
-            "documents": info["doc"],
-            "notes": info["notes"],
-            "source": "Built-in database (verify at travel.state.gov)",
-        }
-
-    return {
-        "country": country,
-        "visa_required": "Unknown",
-        "notes": f"Country '{country}' not in built-in database. Check travel.state.gov for current requirements.",
-        "links": [
-            f"https://travel.state.gov/content/travel/en/international-travel/International-Travel-Country-Information-Pages/{country.replace(' ', '-')}.html",
-            "https://www.iatatravelcentre.com/",
-        ],
-    }
-
-
 def cmd_visa(args):
     country = args.destination
 
     _log(f"Checking visa requirements for {country} (US passport)...")
-    result = _lookup_visa(country)
+    result = lookup_visa(country)
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -726,10 +267,6 @@ def cmd_visa(args):
             print(f"\n  Source: {result['source']}")
         print()
 
-
-# ---------------------------------------------------------------------------
-# vplan save
-# ---------------------------------------------------------------------------
 
 def cmd_save(args):
     title = args.title
@@ -801,92 +338,13 @@ def cmd_save(args):
         print()
 
 
-# ---------------------------------------------------------------------------
-# vplan itinerary
-# ---------------------------------------------------------------------------
-
-def _generate_itinerary(destination: str, nights: int, ages: list[int]) -> dict:
-    age_groups = []
-    for age in ages:
-        if age < 5:
-            age_groups.append("toddler")
-        elif age < 10:
-            age_groups.append("young child")
-        elif age < 14:
-            age_groups.append("tween")
-        else:
-            age_groups.append("teen")
-
-    itinerary = {
-        "destination": destination,
-        "nights": nights,
-        "travelers": f"2 adults + {len(ages)} kids (ages {', '.join(str(a) for a in ages)})",
-        "age_groups": list(set(age_groups)),
-        "days": [],
-    }
-
-    for day_num in range(1, nights + 2):
-        day = {"day": day_num}
-
-        if day_num == 1:
-            day["theme"] = "Arrival & Settle In"
-            day["activities"] = [
-                "Arrive and check in to hotel/resort",
-                "Explore immediate surroundings",
-                "Grocery/supply run if self-catering",
-                "Easy dinner near hotel — let kids decompress",
-            ]
-        elif day_num == nights + 1:
-            day["theme"] = "Departure"
-            day["activities"] = [
-                "Pack and check out",
-                "Last breakfast spot",
-                "Airport transfer — allow extra time with kids",
-            ]
-        else:
-            day["theme"] = f"Day {day_num} — Explore"
-            day["activities"] = [
-                f"Morning: Top attraction/activity for {destination}",
-                "Mid-morning: Snack break (important with kids)",
-                "Lunch at local restaurant",
-                "Afternoon: Beach/pool time or secondary activity",
-                "Late afternoon: Rest at hotel (nap time for younger ones)",
-                "Evening: Dinner — mix upscale and casual",
-            ]
-
-            if "young child" in age_groups or "toddler" in age_groups:
-                day["kid_tips"] = [
-                    "Build in downtime — young kids need breaks",
-                    "Pack snacks and water",
-                    "Have a backup indoor activity for meltdowns",
-                ]
-
-            if "tween" in age_groups or "teen" in age_groups:
-                day["teen_tips"] = [
-                    "Let older kids choose one activity per day",
-                    "Consider splitting up — adults + younger vs teens doing adventure activity",
-                ]
-
-        itinerary["days"].append(day)
-
-    itinerary["packing_tips"] = [
-        "Sunscreen + hats for all kids",
-        "Snorkeling gear if beach destination",
-        "Travel games / tablets for transit",
-        "First aid kit — bandaids, Tylenol, Benadryl",
-        "Copies of all passports",
-    ]
-
-    return itinerary
-
-
 def cmd_itinerary(args):
     destination = args.destination
     nights = args.nights
     ages = [int(a.strip()) for a in args.ages.split(",")]
 
     _log(f"Generating itinerary: {destination}, {nights} nights, kids ages {ages}...")
-    result = _generate_itinerary(destination, nights, ages)
+    result = generate_itinerary(destination, nights, ages)
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -917,71 +375,84 @@ def cmd_itinerary(args):
         print()
 
 
-# ---------------------------------------------------------------------------
-# vplan search (live award search via seats.aero)
-# ---------------------------------------------------------------------------
+def _print_flight_list(flights: list, label: str):
+    print(f"\n  {label} ({len(flights)} options):")
+    seen = set()
+    for flight in flights:
+        key = (flight["carriers"], flight["mileage_cost"], flight["stops"], flight["duration"])
+        if key in seen:
+            continue
+        seen.add(key)
+        miles = flight["mileage_cost"]
+        miles_str = f"{miles:,}" if isinstance(miles, int) else str(miles)
+        seats = flight["remaining_seats"]
+        seats_str = f"{seats} seats" if seats else ""
+        stops = flight["stops"]
+        stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
+        print(f"\n    {flight['carriers']} | {miles_str} miles | ${flight['taxes_usd']:.0f} tax | {stop_str} | {flight['duration']}")
+        if seats_str:
+            print(f"      {seats_str} remaining | via {flight['source']}")
+        else:
+            print(f"      via {flight['source']}")
+
 
 def cmd_search(args):
     origin = args.origin
     dest = args.dest
     cabin = args.cabin
     limit = args.limit
+    round_trip = getattr(args, "round_trip", False)
 
-    _log(f"Searching award flights: {origin} -> {dest} ({cabin})...")
+    _log(f"Searching award flights: {origin} -> {dest} ({cabin}){'(round trip)' if round_trip else ''}...")
     _log("This uses seats.aero and requires a browser — may take 15-30 seconds...")
 
-    from vplan_cli.scraper_seats import SeatsAeroScraper
+    if round_trip:
+        from vplan_cli.scraper_seats import search_round_trip
+        rt = search_round_trip(origin, dest, cabin, limit)
+        outbound = rt["outbound"]
+        ret = rt["return"]
 
-    with SeatsAeroScraper(headless=True) as scraper:
-        results = scraper.search_flights(origin, dest, cabin, limit)
-
-    if not results:
-        _log("No award flights found.")
         if args.json:
-            print(json.dumps({"flights": [], "origin": origin, "destination": dest}))
-        return
-
-    if args.json:
-        print(json.dumps({"flights": results, "origin": origin, "destination": dest}, indent=2))
-    else:
-        print(f"\n{'=' * 70}")
-        print(f"  Award Flights: {origin} -> {dest} ({cabin})")
-        print(f"  {len(results)} options found via seats.aero")
-        print(f"{'=' * 70}")
-
-        seen = set()
-        for flight in results:
-            key = (flight["carriers"], flight["mileage_cost"], flight["stops"], flight["duration"])
-            if key in seen:
-                continue
-            seen.add(key)
-
-            miles = flight["mileage_cost"]
-            miles_str = f"{miles:,}" if isinstance(miles, int) else str(miles)
-            seats = flight["remaining_seats"]
-            seats_str = f"{seats} seats" if seats else ""
-            taxes = flight["taxes_usd"]
-            stops = flight["stops"]
-            stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
-            duration = flight["duration"]
-            source = flight["source"]
-            carriers = flight["carriers"]
-
-            print(f"\n  {carriers} | {miles_str} miles | ${taxes:.0f} tax | {stop_str} | {duration}")
-            if seats_str:
-                print(f"    {seats_str} remaining | via {source}")
+            print(json.dumps({"outbound": outbound, "return": ret, "origin": origin, "destination": dest}, indent=2))
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  Round Trip: {origin} <-> {dest} ({cabin})")
+            print(f"{'=' * 70}")
+            if outbound:
+                _print_flight_list(outbound, f"Outbound: {origin} -> {dest}")
             else:
-                print(f"    via {source}")
+                print(f"\n  No outbound flights found.")
+            if ret:
+                _print_flight_list(ret, f"Return: {dest} -> {origin}")
+            else:
+                print(f"\n  No return flights found.")
+            print(f"\n{'─' * 70}")
+            print(f"  Data from seats.aero (free tier, last 60 days)")
+            print()
+    else:
+        from vplan_cli.scraper_seats import SeatsAeroScraper
+        with SeatsAeroScraper(headless=True) as scraper:
+            results = scraper.search_flights(origin, dest, cabin, limit)
 
-        print(f"\n{'─' * 70}")
-        print(f"  Data from seats.aero (free tier, last 60 days)")
-        print(f"  For real-time booking, check airline sites directly.")
-        print()
+        if not results:
+            _log("No award flights found.")
+            if args.json:
+                print(json.dumps({"flights": [], "origin": origin, "destination": dest}))
+            return
 
+        if args.json:
+            print(json.dumps({"flights": results, "origin": origin, "destination": dest}, indent=2))
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  Award Flights: {origin} -> {dest} ({cabin})")
+            print(f"  {len(results)} options found via seats.aero")
+            print(f"{'=' * 70}")
+            _print_flight_list(results, f"{origin} -> {dest}")
+            print(f"\n{'─' * 70}")
+            print(f"  Data from seats.aero (free tier, last 60 days)")
+            print(f"  For real-time booking, check airline sites directly.")
+            print()
 
-# ---------------------------------------------------------------------------
-# vplan login (store credentials)
-# ---------------------------------------------------------------------------
 
 def cmd_login(args):
     import getpass
@@ -994,10 +465,6 @@ def cmd_login(args):
     _log(f"Credentials saved for {service} in ~/.vplan/credentials.json")
     print(f"Saved {service} login for {username}")
 
-
-# ---------------------------------------------------------------------------
-# vplan trips (persistent trip storage)
-# ---------------------------------------------------------------------------
 
 def cmd_trips(args):
     action = args.trips_action
@@ -1069,90 +536,6 @@ def cmd_trips(args):
         print(f"Saved trip '{name}' to {path}")
 
 
-# ---------------------------------------------------------------------------
-# vplan hotels (hotel search with links)
-# ---------------------------------------------------------------------------
-
-HYATT_CATEGORIES = {
-    1: {"points": 3500, "label": "Category 1"},
-    2: {"points": 6500, "label": "Category 2"},
-    3: {"points": 9000, "label": "Category 3"},
-    4: {"points": 15000, "label": "Category 4"},
-    5: {"points": 20000, "label": "Category 5"},
-    6: {"points": 25000, "label": "Category 6"},
-    7: {"points": 30000, "label": "Category 7"},
-    8: {"points": 40000, "label": "Category 8"},
-}
-
-
-def _search_hotels_liteapi(city: str, country_code: str, checkin: str, checkout: str,
-                           adults: int = 2, children: int = 3) -> list[dict]:
-    if not LITEAPI_KEY:
-        return []
-
-    try:
-        r = requests.post(
-            "https://api.liteapi.travel/v3.0/hotels/rates",
-            headers={"X-API-Key": LITEAPI_KEY, "Content-Type": "application/json"},
-            json={
-                "checkin": checkin,
-                "checkout": checkout,
-                "currency": "USD",
-                "guestNationality": "US",
-                "occupancies": [{"adults": adults, "children": children}],
-                "cityName": city,
-                "countryCode": country_code,
-                "limit": 20,
-            },
-            timeout=15,
-        )
-        if r.status_code != 200:
-            _log(f"LiteAPI returned {r.status_code}: {r.text[:200]}")
-            return []
-
-        data = r.json()
-        hotels_raw = data.get("data", {}).get("hotels", [])
-        if not hotels_raw:
-            hotels_raw = data.get("data", [])
-
-        hotels = []
-        for h in hotels_raw[:20]:
-            name = h.get("name", h.get("hotelName", "Unknown"))
-            rating = h.get("rating", h.get("starRating", ""))
-            address = h.get("address", "")
-
-            rates = h.get("rates", h.get("roomTypes", []))
-            best_rate = None
-            for rate in (rates if isinstance(rates, list) else [rates]):
-                price = rate.get("totalPrice", rate.get("retailRate", {}).get("total", [{}]))
-                if isinstance(price, list):
-                    price = price[0].get("amount") if price else None
-                elif isinstance(price, dict):
-                    price = price.get("amount", price.get("total"))
-                if price is not None:
-                    try:
-                        price = float(price)
-                    except (ValueError, TypeError):
-                        continue
-                    if best_rate is None or price < best_rate:
-                        best_rate = price
-
-            hotels.append({
-                "name": name,
-                "rating": rating,
-                "address": address,
-                "price_usd": best_rate,
-                "room_type": rates[0].get("roomType", rates[0].get("name", "")) if rates else "",
-            })
-
-        hotels.sort(key=lambda x: x["price_usd"] if x["price_usd"] is not None else 999999)
-        return hotels
-
-    except requests.RequestException as e:
-        _log(f"LiteAPI request failed: {e}")
-        return []
-
-
 def cmd_hotels(args):
     destination = args.destination
     checkin = args.checkin
@@ -1184,7 +567,7 @@ def cmd_hotels(args):
 
     if LITEAPI_KEY:
         _log(f"Searching live hotel rates via LiteAPI...")
-        live = _search_hotels_liteapi(destination, country_code, checkin, checkout)
+        live = search_hotels_liteapi(destination, country_code, checkin, checkout)
         result["live_hotels"] = live
     else:
         _log("Set LITEAPI_KEY env var for live hotel pricing (free at dashboard.liteapi.travel)")
@@ -1236,10 +619,6 @@ def cmd_hotels(args):
         print()
 
 
-# ---------------------------------------------------------------------------
-# vplan plan (full pipeline)
-# ---------------------------------------------------------------------------
-
 def cmd_plan(args):
     destination = args.destination
     dest_code = args.dest_code
@@ -1259,35 +638,30 @@ def cmd_plan(args):
     print(f"  {nights} nights in {month} | {trip_data['family']}")
     print(f"{'=' * 70}")
 
-    # 1. Research
     _log(f"\n[1/5] Researching {destination}...")
-    s = requests.Session()
-    s.headers.update({"User-Agent": DEFAULT_UA})
+    s = _session()
 
-    wiki = _scrape_wikivoyage(destination, s)
-    weather = _fetch_weather(destination, month, s)
+    wiki = scrape_wikivoyage(destination, s)
+    weather = fetch_weather(destination, month, s)
     trip_data["overview"] = wiki.get("Overview", "")[:500]
     trip_data["weather"] = weather
 
     print(f"\n  Overview: {trip_data['overview'][:200]}...")
     print(f"  Weather: {weather}")
 
-    # 2. Visa
     _log(f"\n[2/5] Checking entry requirements...")
-    visa = _lookup_visa(destination)
+    visa = lookup_visa(destination)
     trip_data["visa"] = visa.get("summary", "Check entry requirements")
 
     print(f"  Visa: {trip_data['visa'][:150]}")
 
-    # 3. Award flights (static chart)
     _log(f"\n[3/5] Checking award availability for {dest_code}...")
-    awards = _lookup_awards("IAD", dest_code, month)
+    awards = lookup_awards("IAD", dest_code, month)
     trip_data["award_programs"] = awards.get("programs", [])
 
     for prog in awards.get("programs", [])[:3]:
         print(f"  {prog['program']}: {prog.get('balance', 'N/A')}")
 
-    # 4. Points optimization
     _log(f"\n[4/5] Calculating points strategy...")
     trip_data["points_balances"] = {
         "chase_ur": f"{POINTS['chase_ur']['balance']:,}",
@@ -1295,15 +669,13 @@ def cmd_plan(args):
         "delta": f"{POINTS['delta']['balance']:,}",
     }
 
-    # 5. Itinerary
     _log(f"\n[5/5] Generating itinerary...")
     ages = [int(a) for a in "8,10,14".split(",")]
-    itinerary = _generate_itinerary(destination, nights, ages)
+    itinerary = generate_itinerary(destination, nights, ages)
     trip_data["itinerary_days"] = len(itinerary.get("days", []))
 
     print(f"  Itinerary: {trip_data['itinerary_days']} days planned")
 
-    # Save trip
     path = save_trip(destination, trip_data)
     print(f"\n{'─' * 70}")
     print(f"  Trip saved to {path}")
@@ -1311,9 +683,323 @@ def cmd_plan(args):
     print()
 
 
-# ---------------------------------------------------------------------------
-# vplan alert (cheap award search)
-# ---------------------------------------------------------------------------
+def cmd_compare(args):
+    destinations = args.destinations
+    month = args.month or ""
+    origin = args.origin
+
+    if len(destinations) < 2:
+        print("Error: provide at least 2 destinations to compare.", file=sys.stderr)
+        sys.exit(1)
+
+    from vplan_cli.advisor import (
+        DESTINATION_CODES,
+        _gather_destination_context,
+    )
+
+    _log(f"Comparing {len(destinations)} destinations...")
+
+    contexts = []
+    for dest in destinations:
+        code = DESTINATION_CODES.get(dest.lower(), dest.upper() if len(dest) == 3 else "")
+        _log(f"  Fetching data for {dest} ({code})...")
+        ctx = _gather_destination_context(dest, code, origin, month if month else None, live=False)
+        contexts.append(ctx)
+
+    if args.json:
+        print(json.dumps(contexts, indent=2))
+        return
+
+    col_width = max(20, 70 // len(contexts))
+
+    def _col(text: str, width: int = col_width) -> str:
+        text = str(text)
+        return text[:width].ljust(width)
+
+    header = "  " + "".join(_col(ctx.get("destination", "?").upper()) for ctx in contexts)
+    sep = "  " + "─" * (col_width * len(contexts))
+
+    print(f"\n{'=' * (col_width * len(contexts) + 2)}")
+    print(f"  Destination Comparison — {month or 'Any month'}")
+    print(f"  Origin: {origin}")
+    print(f"{'=' * (col_width * len(contexts) + 2)}")
+    print(header)
+    print(sep)
+
+    rows = [
+        ("Weather", lambda c: c.get("weather", "N/A")[:col_width - 2]),
+        ("Visa", lambda c: (
+            "No visa" if c.get("visa", {}).get("required") is False
+            else "Visa req'd" if c.get("visa", {}).get("required") is True
+            else "Unknown"
+        )),
+        ("Nonstop", lambda c: (
+            f"{c['nonstop']['from']} via {','.join(c['nonstop']['airlines'])}"
+            if c.get("nonstop") else "No nonstop"
+        )),
+        ("Family", lambda c: "; ".join(c.get("family_tips", []))[:col_width - 2] if c.get("family_tips") else "N/A"),
+    ]
+
+    for prog_name in ["United MileagePlus", "Chase UR -> United (1:1 transfer)", "Delta SkyMiles"]:
+        def _make_prog_fn(pn: str):
+            def fn(c):
+                for p in c.get("award_programs", []):
+                    if p["program"] == pn:
+                        for k in ["family_of_5_saver", "family_of_5_low"]:
+                            if k in p:
+                                afford = "✓" if p.get("can_afford_saver", p.get("can_afford_low", p.get("can_afford", False))) else "✗"
+                                return f"{p[k]} [{afford}]"
+                        return p.get("balance", "N/A")
+                return "N/A"
+            return fn
+        label = prog_name.split(" ")[0] if len(prog_name) > 12 else prog_name
+        rows.append((label[:12], _make_prog_fn(prog_name)))
+
+    for label, fn in rows:
+        vals = "".join(_col(fn(ctx)) for ctx in contexts)
+        print(f"  {label:<12} {vals}")
+
+    print(sep)
+
+    print(f"\n  Use 'vplan ask \"compare {' vs '.join(destinations)}\"' for AI-powered detailed comparison.")
+    print()
+
+
+def cmd_config(args):
+    action = args.config_action
+
+    if action == "show":
+        data = {
+            "family": FAMILY,
+            "points": POINTS,
+            "sweet_spots": SWEET_SPOTS,
+        }
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print(f"\n{'=' * 60}")
+            print("  vplan configuration")
+            print(f"{'=' * 60}")
+
+            print(f"\n  Family: {FAMILY.get('name', 'N/A')}")
+            print(f"  Adults: {FAMILY.get('adults', 0)}")
+            kids = FAMILY.get("kids", [])
+            print(f"  Kids: {', '.join(kids) if kids else 'None'}")
+            airports = FAMILY.get("home_airports", [])
+            print(f"  Home airports: {', '.join(airports) if airports else 'N/A'}")
+
+            print(f"\n{'─' * 60}")
+            print("  Points balances:")
+            for prog, info in POINTS.items():
+                bal = info.get("balance", 0)
+                extras = []
+                if info.get("status"):
+                    extras.append(info["status"])
+                if info.get("expires"):
+                    extras.append(f"expires {info['expires']}")
+                if info.get("plus_points"):
+                    extras.append(f"{info['plus_points']} PlusPoints")
+                extra_str = f" ({', '.join(extras)})" if extras else ""
+                print(f"    {prog}: {bal:,}{extra_str}")
+
+            print(f"\n{'─' * 60}")
+            print("  Sweet spots:")
+            for sp in SWEET_SPOTS:
+                print(f"    {sp['from']} -> {sp['to']} ({sp['ratio']}): {sp['note']}")
+
+            print(f"\n  Config file: ~/.vplan/config.json")
+            print()
+
+    elif action == "set":
+        key = args.key
+        value = args.value
+
+        if key == "chase_ur" or key == "united" or key == "delta":
+            try:
+                balance = int(value)
+            except ValueError:
+                print(f"Error: balance must be an integer, got '{value}'", file=sys.stderr)
+                sys.exit(1)
+            points = dict(POINTS)
+            if key not in points:
+                points[key] = {}
+            points[key] = dict(points[key])
+            points[key]["balance"] = balance
+            update_config("points", points)
+            print(f"Updated {key} balance to {balance:,}")
+
+        elif key == "name":
+            family = dict(FAMILY)
+            family["name"] = value
+            update_config("family", family)
+            print(f"Updated family name to '{value}'")
+
+        elif key == "adults":
+            try:
+                adults = int(value)
+            except ValueError:
+                print(f"Error: adults must be an integer, got '{value}'", file=sys.stderr)
+                sys.exit(1)
+            family = dict(FAMILY)
+            family["adults"] = adults
+            update_config("family", family)
+            print(f"Updated adults to {adults}")
+
+        elif key == "kids":
+            kids = [k.strip() for k in value.split(",") if k.strip()]
+            family = dict(FAMILY)
+            family["kids"] = kids
+            update_config("family", family)
+            print(f"Updated kids to: {', '.join(kids)}")
+
+        elif key == "airports":
+            airports = [a.strip().upper() for a in value.split(",") if a.strip()]
+            family = dict(FAMILY)
+            family["home_airports"] = airports
+            update_config("family", family)
+            print(f"Updated home airports to: {', '.join(airports)}")
+
+        else:
+            print(f"Unknown config key: {key}", file=sys.stderr)
+            print("Valid keys: chase_ur, united, delta, name, adults, kids, airports", file=sys.stderr)
+            sys.exit(1)
+
+    elif action == "reset":
+        from vplan_cli.config import CONFIG_PATH
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.unlink()
+            print("Config reset to defaults. Restart vplan for changes to take effect.")
+        else:
+            print("No custom config found — already using defaults.")
+
+
+def cmd_ask(args):
+    query = " ".join(args.query)
+    if not query.strip():
+        print("Usage: vplan ask 'your travel question here'", file=sys.stderr)
+        sys.exit(1)
+
+    live = getattr(args, "live", False)
+    model = getattr(args, "model", "gpt-4o-mini")
+    verbose = getattr(args, "verbose", False)
+    export_path = getattr(args, "export", None)
+    copy = getattr(args, "copy", False)
+
+    from vplan_cli.advisor import ask as advisor_ask
+
+    chunks = []
+    for chunk in advisor_ask(query, live=live, model=model, verbose=verbose):
+        print(chunk, end="", flush=True)
+        chunks.append(chunk)
+    print()
+
+    full_response = "".join(chunks)
+
+    if export_path:
+        with open(export_path, "w") as f:
+            if export_path.endswith(".json"):
+                import json as _json
+                _json.dump({"query": query, "response": full_response, "model": model}, f, indent=2)
+            else:
+                f.write(f"# {query}\n\n{full_response}\n")
+        _log(f"Exported to {export_path}")
+
+    if copy:
+        import subprocess
+        copied = False
+        for cmd in [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
+            try:
+                proc = subprocess.run(cmd, input=full_response.encode(), capture_output=True, timeout=5)
+                if proc.returncode == 0:
+                    _log("Copied to clipboard")
+                    copied = True
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        if not copied:
+            _log("Could not copy to clipboard (install xclip or xsel)")
+
+
+def cmd_chat(args):
+    model = getattr(args, "model", "gpt-4o-mini")
+    verbose = getattr(args, "verbose", False)
+
+    from vplan_cli.advisor import chat as advisor_chat
+
+    advisor_chat(model=model, verbose=verbose)
+
+
+def cmd_deals(args):
+    origin = args.origin
+    max_miles = args.max_miles
+    cabin = args.cabin
+    region_filter = getattr(args, "region", "")
+
+    from vplan_cli.routes import NONSTOP_ROUTES
+
+    if origin not in NONSTOP_ROUTES:
+        print(f"No nonstop routes found for {origin}", file=sys.stderr)
+        sys.exit(1)
+
+    routes = NONSTOP_ROUTES[origin]
+    if region_filter:
+        routes = {k: v for k, v in routes.items() if v["region"] == region_filter}
+
+    dest_codes = list(routes.keys())
+    _log(f"Scanning {len(dest_codes)} nonstop routes from {origin} for deals under {max_miles:,} miles...")
+    _log(f"This will use seats.aero — ~30 seconds per route. Scanning up to {min(len(dest_codes), 5)} routes.")
+
+    from vplan_cli.scraper_seats import SeatsAeroScraper
+
+    deals = []
+    scan_limit = min(len(dest_codes), 5)
+
+    with SeatsAeroScraper(headless=True) as scraper:
+        for i, dest in enumerate(dest_codes[:scan_limit]):
+            route_info = NONSTOP_ROUTES[origin][dest]
+            _log(f"  [{i+1}/{scan_limit}] {origin}->{dest} ({route_info['region']})...")
+            flights = scraper.search_flights(origin, dest, cabin, 30)
+            for f in flights:
+                if isinstance(f["mileage_cost"], (int, float)) and f["mileage_cost"] <= max_miles and f["mileage_cost"] > 0:
+                    f["_dest"] = dest
+                    f["_region"] = route_info["region"]
+                    deals.append(f)
+
+    deals.sort(key=lambda x: x["mileage_cost"])
+
+    if args.json:
+        print(json.dumps({"origin": origin, "deals": deals, "routes_scanned": scan_limit}, indent=2))
+        return
+
+    print(f"\n{'=' * 70}")
+    print(f"  Award Deals from {origin} ({cabin}) — under {max_miles:,} miles")
+    print(f"  Scanned {scan_limit}/{len(dest_codes)} nonstop routes")
+    print(f"{'=' * 70}")
+
+    if not deals:
+        print(f"\n  No deals found under {max_miles:,} miles.")
+    else:
+        seen = set()
+        for d in deals:
+            key = (d["_dest"], d["carriers"], d["mileage_cost"], d["stops"])
+            if key in seen:
+                continue
+            seen.add(key)
+            miles = d["mileage_cost"]
+            miles_str = f"{miles:,}" if isinstance(miles, int) else str(miles)
+            stops = d["stops"]
+            stop_str = "nonstop" if stops == 0 else f"{stops}stop"
+            print(f"  {origin}->{d['_dest']} ({d['_region']}): {d['carriers']} | {miles_str}mi | ${d['taxes_usd']:.0f}tax | {stop_str} | {d['source']}")
+
+    if scan_limit < len(dest_codes):
+        remaining = [d for d in dest_codes[scan_limit:]]
+        print(f"\n  {len(remaining)} routes not scanned: {', '.join(remaining[:10])}")
+        print(f"  Re-run with specific routes using: vplan search --dest <CODE> --round-trip")
+
+    print(f"\n{'─' * 70}")
+    print(f"  Data from seats.aero (free tier, cached last ~60 days)")
+    print()
+
 
 def cmd_alert(args):
     origin = args.origin
@@ -1349,10 +1035,6 @@ def cmd_alert(args):
     print(message)
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         prog="vplan",
@@ -1360,7 +1042,6 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # research
     sp_research = subparsers.add_parser("research", help="Research a destination")
     sp_research.add_argument("destination", help="Destination name")
     sp_research.add_argument("--nights", type=int, default=7, help="Number of nights")
@@ -1368,14 +1049,12 @@ def main():
     sp_research.add_argument("--json", action="store_true", help="Output as JSON")
     sp_research.set_defaults(func=cmd_research)
 
-    # points
     sp_points = subparsers.add_parser("points", help="Calculate optimal points redemption")
     sp_points.add_argument("--hotel-rate", type=float, default=0, help="Nightly hotel rate in USD")
     sp_points.add_argument("--flights-usd", type=float, default=0, help="Total flights cost in USD")
     sp_points.add_argument("--json", action="store_true", help="Output as JSON")
     sp_points.set_defaults(func=cmd_points)
 
-    # awards
     sp_awards = subparsers.add_parser("awards", help="Search award availability")
     sp_awards.add_argument("--origin", default="IAD", help="Origin airport code")
     sp_awards.add_argument("--dest", required=True, help="Destination airport code")
@@ -1384,13 +1063,11 @@ def main():
     sp_awards.add_argument("--json", action="store_true", help="Output as JSON")
     sp_awards.set_defaults(func=cmd_awards)
 
-    # visa
     sp_visa = subparsers.add_parser("visa", help="Check visa/entry requirements")
     sp_visa.add_argument("--destination", required=True, help="Country name")
     sp_visa.add_argument("--json", action="store_true", help="Output as JSON")
     sp_visa.set_defaults(func=cmd_visa)
 
-    # save
     sp_save = subparsers.add_parser("save", help="Save trip idea to Karakeep")
     sp_save.add_argument("--title", required=True, help="Trip title")
     sp_save.add_argument("--url", required=True, help="URL to save")
@@ -1399,7 +1076,6 @@ def main():
     sp_save.add_argument("--json", action="store_true", help="Output as JSON")
     sp_save.set_defaults(func=cmd_save)
 
-    # itinerary
     sp_itin = subparsers.add_parser("itinerary", help="Generate day-by-day itinerary")
     sp_itin.add_argument("destination", help="Destination name")
     sp_itin.add_argument("--nights", type=int, default=7, help="Number of nights")
@@ -1407,22 +1083,20 @@ def main():
     sp_itin.add_argument("--json", action="store_true", help="Output as JSON")
     sp_itin.set_defaults(func=cmd_itinerary)
 
-    # search (live award flights via seats.aero)
     sp_search = subparsers.add_parser("search", help="Search live award flight availability")
     sp_search.add_argument("--origin", default="IAD", help="Origin airport code")
     sp_search.add_argument("--dest", required=True, help="Destination airport code")
     sp_search.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"], help="Cabin class")
     sp_search.add_argument("--limit", type=int, default=50, help="Max results")
+    sp_search.add_argument("--round-trip", action="store_true", help="Search both outbound and return flights")
     sp_search.add_argument("--json", action="store_true", help="Output as JSON")
     sp_search.set_defaults(func=cmd_search)
 
-    # login (store credentials)
     sp_login = subparsers.add_parser("login", help="Store login credentials for a service")
     sp_login.add_argument("service", help="Service name (e.g. hyatt, united)")
     sp_login.add_argument("--username", help="Username/email")
     sp_login.set_defaults(func=cmd_login)
 
-    # trips (persistent trip storage)
     sp_trips = subparsers.add_parser("trips", help="Manage saved trips")
     sp_trips.add_argument("trips_action", choices=["list", "show", "save", "delete"])
     sp_trips.add_argument("name", nargs="?", default="")
@@ -1432,7 +1106,6 @@ def main():
     sp_trips.add_argument("--json", action="store_true")
     sp_trips.set_defaults(func=cmd_trips)
 
-    # hotels (award chart + search links)
     sp_hotels = subparsers.add_parser("hotels", help="Search hotels and award pricing")
     sp_hotels.add_argument("destination", help="Destination city")
     sp_hotels.add_argument("--checkin", required=True, help="Check-in date (YYYY-MM-DD)")
@@ -1442,7 +1115,6 @@ def main():
     sp_hotels.add_argument("--json", action="store_true")
     sp_hotels.set_defaults(func=cmd_hotels)
 
-    # plan (full trip planning pipeline)
     sp_plan = subparsers.add_parser("plan", help="Full trip planning pipeline")
     sp_plan.add_argument("destination", help="Destination name")
     sp_plan.add_argument("--dest-code", required=True, help="Destination airport code")
@@ -1450,7 +1122,42 @@ def main():
     sp_plan.add_argument("--nights", type=int, default=7, help="Number of nights")
     sp_plan.set_defaults(func=cmd_plan)
 
-    # alert (cheap award search)
+    sp_compare = subparsers.add_parser("compare", help="Compare destinations side by side")
+    sp_compare.add_argument("destinations", nargs="+", help="Destination names or codes (at least 2)")
+    sp_compare.add_argument("--month", default="", help="Travel month")
+    sp_compare.add_argument("--origin", default="IAD", help="Origin airport code")
+    sp_compare.add_argument("--json", action="store_true")
+    sp_compare.set_defaults(func=cmd_compare)
+
+    sp_config = subparsers.add_parser("config", help="View or edit your configuration (points, family)")
+    sp_config.add_argument("config_action", choices=["show", "set", "reset"], help="show: display config, set: update a value, reset: restore defaults")
+    sp_config.add_argument("key", nargs="?", default="", help="Config key (chase_ur, united, delta, name, adults, kids, airports)")
+    sp_config.add_argument("value", nargs="?", default="", help="New value")
+    sp_config.add_argument("--json", action="store_true")
+    sp_config.set_defaults(func=cmd_config)
+
+    sp_ask = subparsers.add_parser("ask", help="Ask the AI travel advisor a question")
+    sp_ask.add_argument("query", nargs="+", help="Your travel question (e.g., 'beach trip from IAD in April')")
+    sp_ask.add_argument("--live", action="store_true", help="Include live seats.aero data (slower)")
+    sp_ask.add_argument("--model", default="gpt-4o-mini", help="LLM model name (default: gpt-4o-mini)")
+    sp_ask.add_argument("--verbose", "-v", action="store_true", help="Show debug info")
+    sp_ask.add_argument("--export", metavar="FILE", help="Export response to file (.md or .json)")
+    sp_ask.add_argument("--copy", action="store_true", help="Copy response to clipboard")
+    sp_ask.set_defaults(func=cmd_ask)
+
+    sp_chat = subparsers.add_parser("chat", help="Interactive AI travel advisor chat")
+    sp_chat.add_argument("--model", default="gpt-4o-mini", help="LLM model name (default: gpt-4o-mini)")
+    sp_chat.add_argument("--verbose", "-v", action="store_true", help="Show debug info")
+    sp_chat.set_defaults(func=cmd_chat)
+
+    sp_deals = subparsers.add_parser("deals", help="Scan nonstop routes for cheap award deals")
+    sp_deals.add_argument("--origin", default="IAD", help="Origin airport code")
+    sp_deals.add_argument("--max-miles", type=int, default=30000, help="Max miles threshold (default: 30000)")
+    sp_deals.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"])
+    sp_deals.add_argument("--region", default="", help="Filter by region (caribbean, europe, asia, etc.)")
+    sp_deals.add_argument("--json", action="store_true")
+    sp_deals.set_defaults(func=cmd_deals)
+
     sp_alert = subparsers.add_parser("alert", help="Search for cheap award flights and send alerts")
     sp_alert.add_argument("--origin", default="IAD", help="Origin airport code")
     sp_alert.add_argument("--dest", required=True, help="Destination airport code")

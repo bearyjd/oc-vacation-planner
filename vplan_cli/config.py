@@ -15,7 +15,8 @@ except ImportError:
 VPLAN_DIR = Path.home() / ".vplan"
 CONFIG_PATH = VPLAN_DIR / "config.json"
 
-FAMILY = {
+# Defaults — overridden by ~/.vplan/config.json if it exists
+_DEFAULT_FAMILY = {
     "name": "John Beary",
     "adults": 2,
     "kids": ["Ford", "John", "Pennington"],
@@ -23,7 +24,7 @@ FAMILY = {
     "continents_visited": 7,
 }
 
-POINTS = {
+_DEFAULT_POINTS = {
     "chase_ur": {
         "balance": 552585,
         "portal_multiplier": 1.5,
@@ -41,12 +42,45 @@ POINTS = {
     },
 }
 
-SWEET_SPOTS = [
+_DEFAULT_SWEET_SPOTS = [
     {"from": "Chase UR", "to": "Hyatt", "ratio": "1:1", "note": "Best hotel value"},
     {"from": "Chase UR", "to": "United", "ratio": "1:1", "note": "Star Alliance awards"},
     {"from": "United", "to": "ANA/Lufthansa/Singapore", "ratio": "partner", "note": "Star Alliance partners"},
     {"from": "Delta", "to": "Air France/KLM Flying Blue", "ratio": "partner", "note": "SkyTeam partners"},
 ]
+
+
+def _load_user_config() -> dict:
+    """Load user config from ~/.vplan/config.json, return empty dict if not found."""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+_user_cfg = _load_user_config()
+
+FAMILY = _user_cfg.get("family", _DEFAULT_FAMILY)
+POINTS = _user_cfg.get("points", _DEFAULT_POINTS)
+SWEET_SPOTS = _user_cfg.get("sweet_spots", _DEFAULT_SWEET_SPOTS)
+
+
+def update_config(section: str, data: dict | list):
+    """Update a section of the user config and save to disk."""
+    cfg = _load_user_config()
+    cfg[section] = data
+    ensure_dir()
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+    global FAMILY, POINTS, SWEET_SPOTS, _user_cfg
+    _user_cfg = cfg
+    FAMILY = cfg.get("family", _DEFAULT_FAMILY)
+    POINTS = cfg.get("points", _DEFAULT_POINTS)
+    SWEET_SPOTS = cfg.get("sweet_spots", _DEFAULT_SWEET_SPOTS)
 
 KARAKEEP_URL = os.environ.get("KARAKEEP_URL", "")
 KARAKEEP_API_KEY = os.environ.get("KARAKEEP_API_KEY", "")
