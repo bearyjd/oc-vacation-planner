@@ -61,22 +61,42 @@ class SeatsAeroScraper:
             duration_str = ""
 
         taxes_raw = raw.get("totalTaxes") or 0
+        taxes_currency = raw.get("taxesCurrency", "USD")
         if isinstance(taxes_raw, (int, float)):
-            taxes_usd = taxes_raw / 100 if taxes_raw > 100 else taxes_raw
+            taxes_val = taxes_raw / 100 if taxes_raw > 100 else taxes_raw
         else:
-            taxes_usd = 0.0
+            taxes_val = 0.0
+
+        departs_at = raw.get("departsAt", "")
+        arrives_at = raw.get("arrivesAt", "")
+        date_str = ""
+        depart_time = ""
+        arrive_time = ""
+        if departs_at:
+            date_str = departs_at[:10]
+            depart_time = departs_at[11:16] if len(departs_at) > 15 else ""
+        if arrives_at:
+            arrive_time = arrives_at[11:16] if len(arrives_at) > 15 else ""
 
         return {
             "source": raw.get("source", ""),
             "carriers": raw.get("carriers", ""),
-            "route": raw.get("route", ""),
+            "route": raw.get("route", f"{raw.get('originAirport', '')}-{raw.get('destinationAirport', '')}"),
             "mileage_cost": raw.get("mileageCost") or 0,
             "remaining_seats": raw.get("remainingSeats") or 0,
-            "taxes_usd": round(taxes_usd, 2),
+            "taxes": round(taxes_val, 2),
+            "taxes_currency": taxes_currency,
+            "taxes_usd": round(taxes_val, 2),
             "cabin": raw.get("cabin", ""),
             "stops": raw.get("stops", 0),
             "duration": duration_str,
-            "date": raw.get("date", ""),
+            "date": date_str,
+            "depart_time": depart_time,
+            "arrive_time": arrive_time,
+            "flight_numbers": raw.get("flightNumbers", ""),
+            "origin": raw.get("originAirport", ""),
+            "destination": raw.get("destinationAirport", ""),
+            "created_at": raw.get("createdAt", "")[:10] if raw.get("createdAt") else "",
         }
 
     def search_flights(

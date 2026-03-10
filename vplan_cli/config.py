@@ -192,3 +192,23 @@ def delete_trip(slug: str) -> bool:
         path.unlink()
         return True
     return False
+
+
+WATCHLIST_PATH = VPLAN_DIR / "watchlist.json"
+
+
+def load_watchlist() -> list[dict]:
+    if WATCHLIST_PATH.exists():
+        try:
+            with open(WATCHLIST_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def save_watchlist(items: list[dict]):
+    ensure_dir()
+    with open(WATCHLIST_PATH, "w") as f:
+        json.dump(items, f, indent=2)
+    os.chmod(WATCHLIST_PATH, 0o600)

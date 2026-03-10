@@ -19,8 +19,10 @@ from vplan_cli.config import (
     get_credentials,
     list_trips,
     load_trip,
+    load_watchlist,
     save_credentials,
     save_trip,
+    save_watchlist,
     update_config,
 )
 from vplan_cli.data_sources import (
@@ -375,11 +377,11 @@ def cmd_itinerary(args):
         print()
 
 
-def _print_flight_list(flights: list, label: str):
+def _print_flight_list(flights: list, label: str, detailed: bool = False):
     print(f"\n  {label} ({len(flights)} options):")
     seen = set()
     for flight in flights:
-        key = (flight["carriers"], flight["mileage_cost"], flight["stops"], flight["duration"])
+        key = (flight["carriers"], flight["mileage_cost"], flight["stops"], flight["duration"], flight.get("date", ""))
         if key in seen:
             continue
         seen.add(key)
@@ -389,11 +391,26 @@ def _print_flight_list(flights: list, label: str):
         seats_str = f"{seats} seats" if seats else ""
         stops = flight["stops"]
         stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
-        print(f"\n    {flight['carriers']} | {miles_str} miles | ${flight['taxes_usd']:.0f} tax | {stop_str} | {flight['duration']}")
+        tax_cur = flight.get("taxes_currency", "USD")
+        tax_sym = "$" if tax_cur == "USD" else f"{tax_cur} "
+        date_str = f" | {flight['date']}" if flight.get("date") else ""
+        print(f"\n    {flight['carriers']} | {miles_str} miles | {tax_sym}{flight['taxes_usd']:.0f} tax | {stop_str} | {flight['duration']}{date_str}")
+
+        detail_parts = []
         if seats_str:
-            print(f"      {seats_str} remaining | via {flight['source']}")
-        else:
-            print(f"      via {flight['source']}")
+            detail_parts.append(f"{seats_str} remaining")
+        detail_parts.append(f"via {flight['source']}")
+        if detailed:
+            if flight.get("flight_numbers"):
+                detail_parts.append(f"flights: {flight['flight_numbers']}")
+            times = ""
+            if flight.get("depart_time"):
+                times = f"dep {flight['depart_time']}"
+            if flight.get("arrive_time"):
+                times += f" → arr {flight['arrive_time']}"
+            if times:
+                detail_parts.append(times.strip())
+        print(f"      {' | '.join(detail_parts)}")
 
 
 def cmd_search(args):
@@ -402,6 +419,7 @@ def cmd_search(args):
     cabin = args.cabin
     limit = args.limit
     round_trip = getattr(args, "round_trip", False)
+    detailed = getattr(args, "detailed", False)
 
     _log(f"Searching award flights: {origin} -> {dest} ({cabin}){'(round trip)' if round_trip else ''}...")
     _log("This uses seats.aero and requires a browser — may take 15-30 seconds...")
@@ -419,11 +437,11 @@ def cmd_search(args):
             print(f"  Round Trip: {origin} <-> {dest} ({cabin})")
             print(f"{'=' * 70}")
             if outbound:
-                _print_flight_list(outbound, f"Outbound: {origin} -> {dest}")
+                _print_flight_list(outbound, f"Outbound: {origin} -> {dest}", detailed=detailed)
             else:
                 print(f"\n  No outbound flights found.")
             if ret:
-                _print_flight_list(ret, f"Return: {dest} -> {origin}")
+                _print_flight_list(ret, f"Return: {dest} -> {origin}", detailed=detailed)
             else:
                 print(f"\n  No return flights found.")
             print(f"\n{'─' * 70}")
@@ -447,7 +465,7 @@ def cmd_search(args):
             print(f"  Award Flights: {origin} -> {dest} ({cabin})")
             print(f"  {len(results)} options found via seats.aero")
             print(f"{'=' * 70}")
-            _print_flight_list(results, f"{origin} -> {dest}")
+            _print_flight_list(results, f"{origin} -> {dest}", detailed=detailed)
             print(f"\n{'─' * 70}")
             print(f"  Data from seats.aero (free tier, last 60 days)")
             print(f"  For real-time booking, check airline sites directly.")
@@ -680,6 +698,306 @@ def cmd_plan(args):
     print(f"\n{'─' * 70}")
     print(f"  Trip saved to {path}")
     print(f"  View with: vplan trips show {destination.lower().replace(' ', '-')}")
+    print()
+
+
+def cmd_multicity(args):
+    stops = args.stops
+    cabin = args.cabin
+
+    if len(stops) < 3:
+        print("Need at least 3 airport codes (e.g., IAD LHR BCN IAD)", file=sys.stderr)
+        sys.exit(1)
+
+    live = getattr(args, "live", False)
+    detailed = getattr(args, "detailed", False)
+
+    segments = []
+    for i in range(len(stops) - 1):
+        segments.append((stops[i].upper(), stops[i + 1].upper()))
+
+    from vplan_cli.data_sources import lookup_awards, REGION_MAP
+
+    excursionist_eligible = False
+    if len(segments) >= 2:
+        regions = set()
+        for orig, dest in segments:
+            r = REGION_MAP.get(dest, REGION_MAP.get(orig, ""))
+            if r:
+                regions.add(r)
+        if len(regions) <= 2:
+            excursionist_eligible = True
+
+    result: dict = {"segments": [], "excursionist_eligible": excursionist_eligible}
+
+    if not args.json:
+        route_str = " → ".join(stops)
+        print(f"\n{'=' * 70}")
+        print(f"  Multi-City: {route_str} ({cabin})")
+        if excursionist_eligible:
+            print(f"  ★ Potential United Excursionist Perk — one segment could be FREE")
+        print(f"{'=' * 70}")
+
+    total_miles_united = 0
+    total_miles_delta = 0
+
+    for orig, dest in segments:
+        awards = lookup_awards(orig, dest, "")
+        seg_data: dict = {"origin": orig, "destination": dest, "awards": awards}
+
+        if not args.json:
+            print(f"\n{'─' * 70}")
+            print(f"  Segment: {orig} → {dest}")
+
+            for p in awards.get("programs", []):
+                prog_name = p["program"]
+                bal = p.get("balance", "N/A")
+                saver = p.get("saver_rt", p.get("low_rt", "N/A"))
+                print(f"    {prog_name}: {bal} | one-way ~{saver}")
+
+                if "United" in prog_name and "saver_rt" in p:
+                    cost_str = p["saver_rt"].replace(",", "").split(" ")[0]
+                    try:
+                        total_miles_united += int(cost_str) // 2
+                    except ValueError:
+                        pass
+                if "Delta" in prog_name and "low_rt" in p:
+                    cost_str = p["low_rt"].replace(",", "").split(" ")[0]
+                    try:
+                        total_miles_delta += int(cost_str) // 2
+                    except ValueError:
+                        pass
+
+        if live:
+            _log(f"  Searching live: {orig} -> {dest}...")
+            from vplan_cli.scraper_seats import SeatsAeroScraper
+            with SeatsAeroScraper(headless=True) as scraper:
+                flights = scraper.search_flights(orig, dest, cabin, 30)
+            if not args.json and flights:
+                _print_flight_list(flights, f"Live: {orig} → {dest}", detailed=detailed)
+            seg_data["live_flights"] = flights
+
+        result["segments"].append(seg_data)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"\n{'=' * 70}")
+        fam = 5
+        if total_miles_united > 0:
+            total_fam = total_miles_united * fam
+            print(f"  United total (family of {fam}): ~{total_fam:,} miles for all segments")
+            if excursionist_eligible:
+                cheapest_seg = min(total_miles_united // len(segments), total_miles_united)
+                saved = cheapest_seg * fam
+                print(f"  With Excursionist Perk: ~{(total_fam - saved):,} miles (save ~{saved:,})")
+        if total_miles_delta > 0:
+            print(f"  Delta total (family of {fam}): ~{total_miles_delta * fam:,} SkyMiles for all segments")
+
+        if excursionist_eligible:
+            print(f"\n  ★ United Excursionist Perk: Book as multi-city on united.com")
+            print(f"    One intra-region segment can be free when booked as part of round trip")
+
+        print()
+
+
+def cmd_watch(args):
+    action = args.watch_action
+
+    if action == "add":
+        origin = args.origin
+        dest = args.dest
+        cabin = args.cabin or "economy"
+        max_miles = args.max_miles or 50000
+        name = args.name or f"{origin}-{dest}"
+
+        items = load_watchlist()
+        entry = {
+            "name": name,
+            "origin": origin,
+            "dest": dest,
+            "cabin": cabin,
+            "max_miles": max_miles,
+        }
+        items.append(entry)
+        save_watchlist(items)
+        print(f"Added watchlist: {name} ({origin}->{dest}, {cabin}, max {max_miles:,} miles)")
+
+    elif action == "list":
+        items = load_watchlist()
+        if not items:
+            print("Watchlist is empty. Use 'vplan watch add --origin IAD --dest CUN' to add one.")
+            return
+        if args.json:
+            print(json.dumps(items, indent=2))
+            return
+        print(f"\n{'=' * 60}")
+        print(f"  Watchlist ({len(items)} searches)")
+        print(f"{'=' * 60}")
+        for i, item in enumerate(items, 1):
+            print(f"  {i}. {item['name']}: {item['origin']}->{item['dest']} ({item['cabin']}, max {item['max_miles']:,}mi)")
+        print()
+
+    elif action == "remove":
+        index = args.index
+        items = load_watchlist()
+        if index < 1 or index > len(items):
+            print(f"Invalid index {index}. Run 'vplan watch list' to see items.", file=sys.stderr)
+            sys.exit(1)
+        removed = items.pop(index - 1)
+        save_watchlist(items)
+        print(f"Removed: {removed['name']}")
+
+    elif action == "run":
+        items = load_watchlist()
+        if not items:
+            print("Watchlist is empty. Nothing to check.")
+            return
+
+        log_path = getattr(args, "log", "")
+        _log(f"Running {len(items)} watchlist searches...")
+
+        from vplan_cli.scraper_seats import SeatsAeroScraper
+        from datetime import datetime
+
+        all_deals = []
+        with SeatsAeroScraper(headless=True) as scraper:
+            for i, item in enumerate(items):
+                _log(f"  [{i+1}/{len(items)}] {item['origin']}->{item['dest']} ({item['cabin']})...")
+                flights = scraper.search_flights(item["origin"], item["dest"], item["cabin"], 50)
+                max_mi = item["max_miles"]
+                cheap = [
+                    f for f in flights
+                    if isinstance(f["mileage_cost"], (int, float)) and 0 < f["mileage_cost"] <= max_mi
+                ]
+                for f in cheap:
+                    f["_watch"] = item["name"]
+                all_deals.extend(cheap)
+
+        all_deals.sort(key=lambda x: x["mileage_cost"])
+
+        if args.json:
+            print(json.dumps({"timestamp": datetime.now().isoformat(), "deals": all_deals}, indent=2))
+        else:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if not all_deals:
+                output = f"[{timestamp}] No deals found across {len(items)} watchlist searches.\n"
+            else:
+                lines = [f"[{timestamp}] {len(all_deals)} deal(s) found:"]
+                seen = set()
+                for d in all_deals:
+                    key = (d["_watch"], d["carriers"], d["mileage_cost"], d["stops"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    miles = d["mileage_cost"]
+                    miles_str = f"{miles:,}" if isinstance(miles, int) else str(miles)
+                    stops = "nonstop" if d["stops"] == 0 else f"{d['stops']}stop"
+                    date = d.get("date", "")
+                    lines.append(
+                        f"  [{d['_watch']}] {d['carriers']} | {miles_str}mi | "
+                        f"${d['taxes_usd']:.0f}tax | {stops} | {d['duration']} | {date} | {d['source']}"
+                    )
+                output = "\n".join(lines) + "\n"
+
+            print(output, end="")
+
+            if log_path:
+                with open(log_path, "a") as f:
+                    f.write(output)
+                _log(f"Appended to {log_path}")
+
+
+def cmd_calendar(args):
+    import calendar
+    from collections import defaultdict
+
+    origin = args.origin
+    dest = args.dest
+    cabin = args.cabin
+
+    _log(f"Searching award flights: {origin} -> {dest} ({cabin})...")
+    _log("Building calendar from seats.aero data (15-30 seconds)...")
+
+    from vplan_cli.scraper_seats import SeatsAeroScraper
+
+    with SeatsAeroScraper(headless=True) as scraper:
+        flights = scraper.search_flights(origin, dest, cabin, 100)
+
+    if not flights:
+        print("No flights found — cannot build calendar.")
+        return
+
+    if args.json:
+        by_date: dict[str, list] = defaultdict(list)
+        for f in flights:
+            if f.get("date"):
+                by_date[f["date"]].append(f)
+        print(json.dumps({"origin": origin, "destination": dest, "dates": dict(by_date)}, indent=2))
+        return
+
+    cheapest: dict[str, dict] = {}
+    for f in flights:
+        date = f.get("date", "")
+        if not date or len(date) < 10:
+            continue
+        cost = f["mileage_cost"]
+        if not isinstance(cost, (int, float)) or cost <= 0:
+            continue
+        if date not in cheapest or cost < cheapest[date]["mileage_cost"]:
+            cheapest[date] = f
+
+    if not cheapest:
+        print("No dated flights found — seats.aero data may lack date info for this route.")
+        return
+
+    months: dict[str, dict[int, dict]] = defaultdict(dict)
+    for date_str, flight in cheapest.items():
+        try:
+            year, month, day = date_str.split("-")
+            key = f"{year}-{month}"
+            months[key][int(day)] = flight
+        except (ValueError, IndexError):
+            continue
+
+    for month_key in sorted(months.keys()):
+        year, mon = month_key.split("-")
+        year_i, mon_i = int(year), int(mon)
+        month_data = months[month_key]
+
+        print(f"\n{'=' * 62}")
+        print(f"  {calendar.month_name[mon_i]} {year_i} — {origin} -> {dest} ({cabin})")
+        print(f"{'=' * 62}")
+        print(f"  {'Mon':>8}  {'Tue':>8}  {'Wed':>8}  {'Thu':>8}  {'Fri':>8}  {'Sat':>8}  {'Sun':>8}")
+        print(f"  {'─' * 62}")
+
+        cal = calendar.monthcalendar(year_i, mon_i)
+        for week in cal:
+            cells = []
+            for day in week:
+                if day == 0:
+                    cells.append("        ")
+                elif day in month_data:
+                    cost = month_data[day]["mileage_cost"]
+                    if isinstance(cost, int):
+                        if cost >= 100000:
+                            label = f"{cost // 1000}k"
+                        else:
+                            label = f"{cost // 1000}k" if cost >= 1000 else str(cost)
+                    else:
+                        label = "?"
+                    cells.append(f"{day:2d}={label:>4}")
+                else:
+                    cells.append(f"{day:2d}      ")
+            print(f"  {'  '.join(cells)}")
+
+    all_costs = [f["mileage_cost"] for f in cheapest.values() if isinstance(f["mileage_cost"], int)]
+    if all_costs:
+        print(f"\n  Cheapest: {min(all_costs):,} miles | Most expensive: {max(all_costs):,} miles")
+        print(f"  {len(cheapest)} dates with availability across {len(months)} month(s)")
+
+    print(f"\n  Legend: DD=XXk means day DD has availability at XXk miles (cheapest option)")
+    print(f"  Data from seats.aero — cached availability, not real-time.")
     print()
 
 
@@ -1089,6 +1407,7 @@ def main():
     sp_search.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"], help="Cabin class")
     sp_search.add_argument("--limit", type=int, default=50, help="Max results")
     sp_search.add_argument("--round-trip", action="store_true", help="Search both outbound and return flights")
+    sp_search.add_argument("--detailed", "-d", action="store_true", help="Show flight numbers, departure/arrival times")
     sp_search.add_argument("--json", action="store_true", help="Output as JSON")
     sp_search.set_defaults(func=cmd_search)
 
@@ -1121,6 +1440,33 @@ def main():
     sp_plan.add_argument("--month", required=True, help="Travel month (e.g. June)")
     sp_plan.add_argument("--nights", type=int, default=7, help="Number of nights")
     sp_plan.set_defaults(func=cmd_plan)
+
+    sp_multi = subparsers.add_parser("multicity", help="Multi-city award search (A→B→C routing)")
+    sp_multi.add_argument("stops", nargs="+", help="Airport codes in order (e.g., IAD LHR BCN IAD)")
+    sp_multi.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"])
+    sp_multi.add_argument("--live", action="store_true", help="Include live seats.aero data per segment")
+    sp_multi.add_argument("--detailed", "-d", action="store_true", help="Show flight details")
+    sp_multi.add_argument("--json", action="store_true")
+    sp_multi.set_defaults(func=cmd_multicity)
+
+    sp_watch = subparsers.add_parser("watch", help="Manage saved flight searches (watchlist)")
+    sp_watch.add_argument("watch_action", choices=["add", "list", "remove", "run"], help="add/list/remove/run watchlist items")
+    sp_watch.add_argument("--origin", default="IAD", help="Origin airport code")
+    sp_watch.add_argument("--dest", default="", help="Destination airport code")
+    sp_watch.add_argument("--cabin", default="economy", help="Cabin class")
+    sp_watch.add_argument("--max-miles", type=int, default=50000, help="Max miles to alert on")
+    sp_watch.add_argument("--name", default="", help="Watchlist entry name")
+    sp_watch.add_argument("--index", type=int, default=0, help="Index to remove (1-based)")
+    sp_watch.add_argument("--log", default="", help="Append results to log file (for cron)")
+    sp_watch.add_argument("--json", action="store_true")
+    sp_watch.set_defaults(func=cmd_watch)
+
+    sp_calendar = subparsers.add_parser("calendar", help="Show award availability calendar (month grid)")
+    sp_calendar.add_argument("--origin", default="IAD", help="Origin airport code")
+    sp_calendar.add_argument("--dest", required=True, help="Destination airport code")
+    sp_calendar.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"])
+    sp_calendar.add_argument("--json", action="store_true")
+    sp_calendar.set_defaults(func=cmd_calendar)
 
     sp_compare = subparsers.add_parser("compare", help="Compare destinations side by side")
     sp_compare.add_argument("destinations", nargs="+", help="Destination names or codes (at least 2)")
