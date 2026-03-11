@@ -15,7 +15,9 @@ dependencies = [
     "playwright-stealth>=2.0",
     "python-dotenv>=1.0",
     "openai>=1.0",
+    "mcp[cli]>=1.0",
 ]
 
 [project.scripts]
 vplan = "vplan_cli.cli:main"
+vplan-mcp = "vplan_cli.mcp_server:main"

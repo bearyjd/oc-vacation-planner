@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import textwrap
+import time
 
 import requests
 
@@ -1319,6 +1320,117 @@ def cmd_deals(args):
     print()
 
 
+def cmd_chase(args):
+    action = args.chase_action
+    profile = getattr(args, "profile", "") or None
+    dump_raw = getattr(args, "dump_raw", False)
+
+    from vplan_cli.scraper_chase import ChaseTravel
+
+    if action == "login":
+        _log("Opening Chase Travel — log in manually, then explore freely.")
+        _log("API responses will be captured in the background.")
+        _log("Press Ctrl+C when done.\n")
+        with ChaseTravel(profile_dir=profile) as ct:
+            ct.open_browser()
+            ct.navigate_to_login()
+            try:
+                ct.wait_for_auth(timeout_seconds=600)
+                _log("\nAuthenticated! Browse Chase Travel to capture results.")
+                _log("Press Ctrl+C when done.\n")
+                while True:
+                    time.sleep(5)
+                    captured = ct.get_captured()
+                    if captured:
+                        _log(f"  {len(captured)} result(s) captured so far...")
+            except KeyboardInterrupt:
+                results = ct.get_captured()
+                if results:
+                    print(json.dumps(results, indent=2))
+                else:
+                    _log("No results captured.")
+                    if dump_raw:
+                        raw = ct.get_raw_api_responses()
+                        if raw:
+                            print(json.dumps(raw, indent=2, default=str))
+        return
+
+    if action == "flights":
+        origin = getattr(args, "origin", "IAD")
+        dest = getattr(args, "dest", "")
+
+        _log(f"Chase Travel flight search: {origin} -> {dest}")
+        _log("A browser will open — log in to your Chase account.")
+        _log("Then search for flights. Results will be captured automatically.\n")
+
+        with ChaseTravel(profile_dir=profile) as ct:
+            results = ct.interactive_session("flights", origin=origin, destination=dest)
+
+        if not results:
+            _log("No flight results captured.")
+            return
+
+        flights = [r for r in results if r.get("type") == "flight"]
+        if args.json:
+            print(json.dumps({"flights": flights, "origin": origin, "destination": dest}, indent=2))
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  Chase Travel Flights: {origin} -> {dest}")
+            print(f"  {len(flights)} result(s) captured")
+            print(f"{'=' * 70}")
+            for f in flights:
+                pts = f.get("ur_points", 0)
+                pts_str = f"{pts:,} UR" if pts else "N/A"
+                cash = f.get("cash_price_usd", 0)
+                cash_str = f"${cash:,.0f}" if cash else "N/A"
+                carrier = f.get("carrier", "?")
+                stops = f.get("stops", 0)
+                stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
+                duration = f.get("duration", "")
+                print(f"\n    {carrier} | {pts_str} | {cash_str} cash | {stop_str} | {duration}")
+                if f.get("departure"):
+                    print(f"      dep {f['departure'][:16]} → arr {f.get('arrival', '')[:16]}")
+            print()
+
+    elif action == "hotels":
+        city = getattr(args, "city", "")
+        checkin = getattr(args, "checkin", "")
+        checkout = getattr(args, "checkout", "")
+
+        _log(f"Chase Travel hotel search: {city}")
+        _log("A browser will open — log in to your Chase account.")
+        _log("Then search for hotels. Results will be captured automatically.\n")
+
+        with ChaseTravel(profile_dir=profile) as ct:
+            results = ct.interactive_session("hotels", city=city, checkin=checkin, checkout=checkout)
+
+        if not results:
+            _log("No hotel results captured.")
+            return
+
+        hotels = [r for r in results if r.get("type") == "hotel"]
+        if args.json:
+            print(json.dumps({"hotels": hotels, "city": city}, indent=2))
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  Chase Travel Hotels: {city}")
+            print(f"  {len(hotels)} result(s) captured")
+            print(f"{'=' * 70}")
+            for h in hotels:
+                name = h.get("name", "?")[:40]
+                pts = h.get("ur_points", 0)
+                pts_str = f"{pts:,} UR" if pts else "N/A"
+                nightly = h.get("nightly_usd", 0)
+                nightly_str = f"${nightly:,.0f}/nt" if nightly else ""
+                total = h.get("total_usd", 0)
+                total_str = f"${total:,.0f} total" if total else ""
+                rating = h.get("rating", 0)
+                stars = f"{'★' * int(rating)}" if rating else ""
+                print(f"\n    {name:<40} {stars}")
+                print(f"      {pts_str} | {nightly_str} | {total_str}")
+            print()
+
+
 def cmd_alert(args):
     origin = args.origin
     dest = args.dest
@@ -1510,6 +1622,19 @@ def main():
     sp_alert.add_argument("--max-miles", type=int, required=True, help="Max miles threshold")
     sp_alert.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"])
     sp_alert.set_defaults(func=cmd_alert)
+
+    sp_chase = subparsers.add_parser("chase", help="Search Chase Travel portal (opens browser for manual login)")
+    sp_chase.add_argument("chase_action", choices=["login", "flights", "hotels"],
+                          help="login: authenticate and browse; flights: search flights; hotels: search hotels")
+    sp_chase.add_argument("--origin", default="IAD", help="Flight origin airport code")
+    sp_chase.add_argument("--dest", default="", help="Flight destination airport code")
+    sp_chase.add_argument("--city", default="", help="Hotel search city")
+    sp_chase.add_argument("--checkin", default="", help="Hotel check-in date (YYYY-MM-DD)")
+    sp_chase.add_argument("--checkout", default="", help="Hotel check-out date (YYYY-MM-DD)")
+    sp_chase.add_argument("--profile", default="", help="Browser profile directory (persists login session)")
+    sp_chase.add_argument("--dump-raw", action="store_true", help="Show raw API responses (for debugging)")
+    sp_chase.add_argument("--json", action="store_true")
+    sp_chase.set_defaults(func=cmd_chase)
 
     args = parser.parse_args()
     if not args.command:
