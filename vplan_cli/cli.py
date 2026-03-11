@@ -877,6 +877,10 @@ def cmd_watch(args):
 
         all_deals.sort(key=lambda x: x["mileage_cost"])
 
+        if all_deals:
+            from vplan_cli.config import append_deal_history
+            append_deal_history(all_deals, source="watchlist")
+
         if args.json:
             print(json.dumps({"timestamp": datetime.now().isoformat(), "deals": all_deals}, indent=2))
         else:
@@ -1322,113 +1326,219 @@ def cmd_deals(args):
 
 def cmd_chase(args):
     action = args.chase_action
-    profile = getattr(args, "profile", "") or None
-    dump_raw = getattr(args, "dump_raw", False)
 
-    from vplan_cli.scraper_chase import ChaseTravel
+    from vplan_cli.scraper_chase import import_chase_captures
 
-    if action == "login":
-        _log("Opening Chase Travel — log in manually, then explore freely.")
-        _log("API responses will be captured in the background.")
-        _log("Press Ctrl+C when done.\n")
-        with ChaseTravel(profile_dir=profile) as ct:
-            ct.open_browser()
-            ct.navigate_to_login()
-            try:
-                ct.wait_for_auth(timeout_seconds=600)
-                _log("\nAuthenticated! Browse Chase Travel to capture results.")
-                _log("Press Ctrl+C when done.\n")
-                while True:
-                    time.sleep(5)
-                    captured = ct.get_captured()
-                    if captured:
-                        _log(f"  {len(captured)} result(s) captured so far...")
-            except KeyboardInterrupt:
-                results = ct.get_captured()
-                if results:
-                    print(json.dumps(results, indent=2))
-                else:
-                    _log("No results captured.")
-                    if dump_raw:
-                        raw = ct.get_raw_api_responses()
-                        if raw:
-                            print(json.dumps(raw, indent=2, default=str))
+    if action == "import":
+        filepath = getattr(args, "file", "") or ""
+        result = import_chase_captures(filepath)
+
+        if result.get("error"):
+            _log(result["error"])
+            if not result["flights"] and not result["hotels"]:
+                return
+
+        flights = result.get("flights", [])
+        hotels = result.get("hotels", [])
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  Chase Travel Import")
+            print(f"  {result.get('total_captures', 0)} captures, {result.get('api_responses', 0)} API responses")
+            print(f"  {len(flights)} flights, {len(hotels)} hotels")
+            print(f"{'=' * 70}")
+
+            if flights:
+                print(f"\n  Flights ({len(flights)}):")
+                for f in flights:
+                    pts = f.get("ur_points", 0)
+                    pts_str = f"{pts:,} UR" if pts else "N/A"
+                    cash = f.get("cash_price_usd", 0)
+                    cash_str = f"${cash:,.0f}" if cash else "N/A"
+                    carrier = f.get("carrier", "?")
+                    stops = f.get("stops", 0)
+                    stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
+                    print(f"    {carrier} | {f.get('origin','')}->{f.get('destination','')} | {pts_str} | {cash_str} | {stop_str}")
+
+            if hotels:
+                print(f"\n  Hotels ({len(hotels)}):")
+                for h in hotels:
+                    name = h.get("name", "?")[:40]
+                    pts = h.get("ur_points", 0)
+                    pts_str = f"{pts:,} UR" if pts else "N/A"
+                    nightly = h.get("nightly_usd", 0)
+                    nightly_str = f"${nightly:,.0f}/nt" if nightly else ""
+                    print(f"    {name:<40} | {pts_str} | {nightly_str}")
+
+            if not flights and not hotels:
+                print("\n  No flight or hotel data found in captures.")
+                print("  Browse chase.com/travel with the extension and search for flights/hotels.")
+            print()
+
+    elif action == "status":
+        from vplan_cli.config import CHASE_CAPTURE_PATH
+        if CHASE_CAPTURE_PATH.exists():
+            captures = import_chase_captures()
+            n_flights = len(captures.get("flights", []))
+            n_hotels = len(captures.get("hotels", []))
+            _log(f"Chase capture file: {CHASE_CAPTURE_PATH}")
+            _log(f"  {captures.get('total_captures', 0)} captures, {n_flights} flights, {n_hotels} hotels")
+        else:
+            _log(f"No capture file found at {CHASE_CAPTURE_PATH}")
+            _log("Install the Chrome extension, browse chase.com/travel, and download captures.")
+
+
+def cmd_export(args):
+    fmt = args.format
+    source = args.source
+    output = args.output
+
+    import csv
+    import io
+    from datetime import datetime
+
+    if source == "trips":
+        trips = list_trips()
+        if not trips:
+            _log("No saved trips.")
+            return
+        if fmt == "csv":
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["slug", "name", "destination", "month"])
+            writer.writeheader()
+            writer.writerows(trips)
+            data = buf.getvalue()
+        else:
+            lines = [f"# Saved Trips ({datetime.now().strftime('%Y-%m-%d')})\n"]
+            for t in trips:
+                lines.append(f"- **{t['name']}**: {t.get('destination', '?')} ({t.get('month', '?')})")
+            data = "\n".join(lines) + "\n"
+
+    elif source == "watchlist":
+        items = load_watchlist()
+        if not items:
+            _log("Watchlist is empty.")
+            return
+        if fmt == "csv":
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["name", "origin", "dest", "cabin", "max_miles"])
+            writer.writeheader()
+            writer.writerows(items)
+            data = buf.getvalue()
+        else:
+            lines = [f"# Watchlist ({datetime.now().strftime('%Y-%m-%d')})\n"]
+            for w in items:
+                lines.append(f"- **{w['name']}**: {w['origin']}->{w['dest']} {w['cabin']} ≤{w['max_miles']:,} mi")
+            data = "\n".join(lines) + "\n"
+
+    elif source == "history":
+        from vplan_cli.config import load_deal_history
+        history = load_deal_history()
+        if not history:
+            _log("No deal history.")
+            return
+        if fmt == "csv":
+            all_keys = set()
+            for h in history:
+                all_keys.update(h.keys())
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=sorted(all_keys))
+            writer.writeheader()
+            writer.writerows(history)
+            data = buf.getvalue()
+        else:
+            lines = [f"# Deal History ({len(history)} entries)\n"]
+            for h in history[-20:]:
+                route = f"{h.get('origin', '?')}->{h.get('destination', '?')}"
+                miles = h.get("mileage_cost", "?")
+                ts = h.get("_recorded_at", "?")[:10]
+                lines.append(f"- [{ts}] {route}: {miles} miles ({h.get('source', '?')})")
+            if len(history) > 20:
+                lines.append(f"\n... and {len(history) - 20} more entries")
+            data = "\n".join(lines) + "\n"
+
+    elif source == "chase":
+        from vplan_cli.scraper_chase import import_chase_captures
+        result = import_chase_captures()
+        flights = result.get("flights", [])
+        hotels = result.get("hotels", [])
+        if not flights and not hotels:
+            _log("No Chase captures to export.")
+            return
+        if fmt == "csv":
+            buf = io.StringIO()
+            if flights:
+                writer = csv.DictWriter(buf, fieldnames=list(flights[0].keys()))
+                writer.writeheader()
+                writer.writerows(flights)
+            if hotels:
+                if flights:
+                    buf.write("\n")
+                writer = csv.DictWriter(buf, fieldnames=list(hotels[0].keys()))
+                writer.writeheader()
+                writer.writerows(hotels)
+            data = buf.getvalue()
+        else:
+            lines = [f"# Chase Travel Results ({datetime.now().strftime('%Y-%m-%d')})\n"]
+            if flights:
+                lines.append(f"## Flights ({len(flights)})\n")
+                for f in flights:
+                    lines.append(f"- {f.get('carrier','?')} {f.get('origin','')}->{f.get('destination','')} | {f.get('ur_points',0):,} UR | ${f.get('cash_price_usd',0):,.0f}")
+            if hotels:
+                lines.append(f"\n## Hotels ({len(hotels)})\n")
+                for h in hotels:
+                    lines.append(f"- {h.get('name','?')} | {h.get('ur_points',0):,} UR | ${h.get('nightly_usd',0):,.0f}/nt")
+            data = "\n".join(lines) + "\n"
+    else:
+        _log(f"Unknown source: {source}")
         return
 
-    if action == "flights":
-        origin = getattr(args, "origin", "IAD")
-        dest = getattr(args, "dest", "")
+    if output:
+        with open(output, "w") as f:
+            f.write(data)
+        _log(f"Exported {source} ({fmt}) to {output}")
+    else:
+        print(data)
 
-        _log(f"Chase Travel flight search: {origin} -> {dest}")
-        _log("A browser will open — log in to your Chase account.")
-        _log("Then search for flights. Results will be captured automatically.\n")
 
-        with ChaseTravel(profile_dir=profile) as ct:
-            results = ct.interactive_session("flights", origin=origin, destination=dest)
+def cmd_cron(args):
+    import shutil
 
-        if not results:
-            _log("No flight results captured.")
-            return
+    vplan_path = shutil.which("vplan") or "vplan"
+    log_path = args.log or "/tmp/vplan-watch.log"
+    schedule = args.schedule or "0 */6 * * *"
 
-        flights = [r for r in results if r.get("type") == "flight"]
-        if args.json:
-            print(json.dumps({"flights": flights, "origin": origin, "destination": dest}, indent=2))
+    line = f"{schedule} {vplan_path} watch run --log {log_path} 2>&1"
+
+    if args.install:
+        import subprocess
+
+        current = ""
+        try:
+            result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            current = result.stdout
+        except FileNotFoundError:
+            pass
+
+        marker = "# vplan watchlist"
+        lines = [l for l in current.splitlines() if marker not in l]
+        lines.append(f"{line}  {marker}")
+        new_crontab = "\n".join(lines) + "\n"
+
+        proc = subprocess.run(
+            ["crontab", "-"], input=new_crontab, capture_output=True, text=True
+        )
+        if proc.returncode == 0:
+            print(f"Installed crontab entry: {line}")
         else:
-            print(f"\n{'=' * 70}")
-            print(f"  Chase Travel Flights: {origin} -> {dest}")
-            print(f"  {len(flights)} result(s) captured")
-            print(f"{'=' * 70}")
-            for f in flights:
-                pts = f.get("ur_points", 0)
-                pts_str = f"{pts:,} UR" if pts else "N/A"
-                cash = f.get("cash_price_usd", 0)
-                cash_str = f"${cash:,.0f}" if cash else "N/A"
-                carrier = f.get("carrier", "?")
-                stops = f.get("stops", 0)
-                stop_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
-                duration = f.get("duration", "")
-                print(f"\n    {carrier} | {pts_str} | {cash_str} cash | {stop_str} | {duration}")
-                if f.get("departure"):
-                    print(f"      dep {f['departure'][:16]} → arr {f.get('arrival', '')[:16]}")
-            print()
-
-    elif action == "hotels":
-        city = getattr(args, "city", "")
-        checkin = getattr(args, "checkin", "")
-        checkout = getattr(args, "checkout", "")
-
-        _log(f"Chase Travel hotel search: {city}")
-        _log("A browser will open — log in to your Chase account.")
-        _log("Then search for hotels. Results will be captured automatically.\n")
-
-        with ChaseTravel(profile_dir=profile) as ct:
-            results = ct.interactive_session("hotels", city=city, checkin=checkin, checkout=checkout)
-
-        if not results:
-            _log("No hotel results captured.")
-            return
-
-        hotels = [r for r in results if r.get("type") == "hotel"]
-        if args.json:
-            print(json.dumps({"hotels": hotels, "city": city}, indent=2))
-        else:
-            print(f"\n{'=' * 70}")
-            print(f"  Chase Travel Hotels: {city}")
-            print(f"  {len(hotels)} result(s) captured")
-            print(f"{'=' * 70}")
-            for h in hotels:
-                name = h.get("name", "?")[:40]
-                pts = h.get("ur_points", 0)
-                pts_str = f"{pts:,} UR" if pts else "N/A"
-                nightly = h.get("nightly_usd", 0)
-                nightly_str = f"${nightly:,.0f}/nt" if nightly else ""
-                total = h.get("total_usd", 0)
-                total_str = f"${total:,.0f} total" if total else ""
-                rating = h.get("rating", 0)
-                stars = f"{'★' * int(rating)}" if rating else ""
-                print(f"\n    {name:<40} {stars}")
-                print(f"      {pts_str} | {nightly_str} | {total_str}")
-            print()
+            print(f"Failed to install crontab: {proc.stderr}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"# Add this to your crontab (crontab -e):")
+        print(line)
+        print(f"\n# Or run: vplan cron --install")
 
 
 def cmd_alert(args):
@@ -1623,18 +1733,25 @@ def main():
     sp_alert.add_argument("--cabin", default="economy", choices=["economy", "premium", "business", "first"])
     sp_alert.set_defaults(func=cmd_alert)
 
-    sp_chase = subparsers.add_parser("chase", help="Search Chase Travel portal (opens browser for manual login)")
-    sp_chase.add_argument("chase_action", choices=["login", "flights", "hotels"],
-                          help="login: authenticate and browse; flights: search flights; hotels: search hotels")
-    sp_chase.add_argument("--origin", default="IAD", help="Flight origin airport code")
-    sp_chase.add_argument("--dest", default="", help="Flight destination airport code")
-    sp_chase.add_argument("--city", default="", help="Hotel search city")
-    sp_chase.add_argument("--checkin", default="", help="Hotel check-in date (YYYY-MM-DD)")
-    sp_chase.add_argument("--checkout", default="", help="Hotel check-out date (YYYY-MM-DD)")
-    sp_chase.add_argument("--profile", default="", help="Browser profile directory (persists login session)")
-    sp_chase.add_argument("--dump-raw", action="store_true", help="Show raw API responses (for debugging)")
+    sp_cron = subparsers.add_parser("cron", help="Generate or install crontab for watchlist monitoring")
+    sp_cron.add_argument("--schedule", default="0 */6 * * *", help="Cron schedule (default: every 6 hours)")
+    sp_cron.add_argument("--log", default="/tmp/vplan-watch.log", help="Log file path")
+    sp_cron.add_argument("--install", action="store_true", help="Install the crontab entry directly")
+    sp_cron.set_defaults(func=cmd_cron)
+
+    sp_chase = subparsers.add_parser("chase", help="Import Chase Travel data from Chrome extension captures")
+    sp_chase.add_argument("chase_action", choices=["import", "status"],
+                          help="import: read chase_capture.json; status: show capture file info")
+    sp_chase.add_argument("--file", default="", help="Path to chase_capture.json (default: ~/.vplan/chase_capture.json)")
     sp_chase.add_argument("--json", action="store_true")
     sp_chase.set_defaults(func=cmd_chase)
+
+    sp_export = subparsers.add_parser("export", help="Export data to CSV or Markdown")
+    sp_export.add_argument("source", choices=["trips", "watchlist", "history", "chase"],
+                           help="Data source to export")
+    sp_export.add_argument("--format", choices=["csv", "md"], default="csv", help="Output format")
+    sp_export.add_argument("--output", "-o", default="", help="Output file path (default: stdout)")
+    sp_export.set_defaults(func=cmd_export)
 
     args = parser.parse_args()
     if not args.command:

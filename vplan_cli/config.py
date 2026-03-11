@@ -195,6 +195,8 @@ def delete_trip(slug: str) -> bool:
 
 
 WATCHLIST_PATH = VPLAN_DIR / "watchlist.json"
+DEAL_HISTORY_PATH = VPLAN_DIR / "deal_history.json"
+CHASE_CAPTURE_PATH = VPLAN_DIR / "chase_capture.json"
 
 
 def load_watchlist() -> list[dict]:
@@ -212,3 +214,41 @@ def save_watchlist(items: list[dict]):
     with open(WATCHLIST_PATH, "w") as f:
         json.dump(items, f, indent=2)
     os.chmod(WATCHLIST_PATH, 0o600)
+
+
+def load_deal_history() -> list[dict]:
+    if DEAL_HISTORY_PATH.exists():
+        try:
+            with open(DEAL_HISTORY_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def append_deal_history(deals: list[dict], source: str = "watchlist"):
+    from datetime import datetime
+    ensure_dir()
+    history = load_deal_history()
+    ts = datetime.now().isoformat()
+    for deal in deals:
+        entry = dict(deal)
+        entry["_recorded_at"] = ts
+        entry["_source"] = source
+        history.append(entry)
+    # Keep last 5000 entries to prevent unbounded growth
+    if len(history) > 5000:
+        history = history[-5000:]
+    with open(DEAL_HISTORY_PATH, "w") as f:
+        json.dump(history, f, indent=2)
+    os.chmod(DEAL_HISTORY_PATH, 0o600)
+
+
+def load_chase_capture() -> list[dict]:
+    if CHASE_CAPTURE_PATH.exists():
+        try:
+            with open(CHASE_CAPTURE_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []

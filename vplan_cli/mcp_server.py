@@ -267,30 +267,15 @@ def multicity_search(stops: str, cabin: str = "economy") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Chase Travel tools (manual-assist — requires visible browser + login)
+# Chase Travel tools (import from Chrome extension captures)
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-def search_chase_flights(origin: str = "IAD", destination: str = "", profile_dir: str = "") -> dict:
-    """Search flights on Chase Travel portal using UR points. REQUIRES manual Chase login in a visible browser window. Takes 2-5 minutes (user must log in and search). Returns flights with UR points pricing."""
-    from vplan_cli.scraper_chase import ChaseTravel
-
-    with ChaseTravel(profile_dir=profile_dir or None) as ct:
-        results = ct.interactive_session("flights", origin=origin, destination=destination)
-        flights = [r for r in results if r.get("type") == "flight"]
-        return {"flights": flights, "origin": origin, "destination": destination, "count": len(flights)}
-
-
-@mcp.tool()
-def search_chase_hotels(city: str = "", checkin: str = "", checkout: str = "", profile_dir: str = "") -> dict:
-    """Search hotels on Chase Travel portal using UR points. REQUIRES manual Chase login in a visible browser window. Takes 2-5 minutes (user must log in and search). Returns hotels with UR points pricing."""
-    from vplan_cli.scraper_chase import ChaseTravel
-
-    with ChaseTravel(profile_dir=profile_dir or None) as ct:
-        results = ct.interactive_session("hotels", city=city, checkin=checkin, checkout=checkout)
-        hotels = [r for r in results if r.get("type") == "hotel"]
-        return {"hotels": hotels, "city": city, "checkin": checkin, "checkout": checkout, "count": len(hotels)}
+def import_chase_data(filepath: str = "") -> dict:
+    """Import Chase Travel flight/hotel data from Chrome extension captures. The user must browse chase.com/travel with the vplan Chrome extension installed, then download chase_capture.json to ~/.vplan/. Returns normalized flights and hotels with UR points pricing."""
+    from vplan_cli.scraper_chase import import_chase_captures
+    return import_chase_captures(filepath)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +330,11 @@ def watchlist_run() -> dict:
             all_deals.extend(cheap)
 
     all_deals.sort(key=lambda x: x["mileage_cost"])
+
+    if all_deals:
+        from vplan_cli.config import append_deal_history
+        append_deal_history(all_deals, source="watchlist")
+
     return {"timestamp": datetime.now().isoformat(), "deals": all_deals, "searches_run": len(items)}
 
 

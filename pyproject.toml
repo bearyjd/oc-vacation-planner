@@ -18,6 +18,9 @@ dependencies = [
     "mcp[cli]>=1.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["vplan_cli*"]
+
 [project.scripts]
 vplan = "vplan_cli.cli:main"
 vplan-mcp = "vplan_cli.mcp_server:main"
